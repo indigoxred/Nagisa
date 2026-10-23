@@ -1,0 +1,2 @@
+"""LAN-only Nagisa WebUI."""
+

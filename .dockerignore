@@ -1,0 +1,13 @@
+.git
+config
+secrets
+*.sqlite3
+*.db
+*.env
+*.log
+tests
+.venv
+__pycache__
+*.pyc
+tests
+

@@ -1,0 +1,23 @@
+name: check
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  source-and-image:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Compile source
+        run: python -m compileall -q src/nagisa
+      - name: Check CLI
+        run: PYTHONPATH=src python -m nagisa --help
+      - name: Build image
+        run: docker build -t nagisa:check .

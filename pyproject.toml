@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nagisa"
+version = "0.1.27"
+description = "Fail-closed Shoko ordering and Sonarr reconciliation for Unraid"
+requires-python = ">=3.13"
+dependencies = []
+
+[project.scripts]
+nagisa = "nagisa.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
