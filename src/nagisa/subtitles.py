@@ -25,6 +25,7 @@ from nagisa.worklist import import_item
 _SUBS = {'.srt', '.ass', '.ssa', '.idx', '.sub'}
 _VIDEOS = {'.mkv', '.mp4', '.avi', '.m4v', '.ts', '.webm', '.mov', '.mpeg', '.mpg'}
 _STATUSES = {'pending', 'waiting-download', 'blocked-source', 'blocked-owner',
+             'held-unlinked-source', 'skipped-outside-root',
              'ambiguous', 'conflict', 'blocked-limit', 'waiting-refresh', 'delivered'}
 
 
@@ -161,6 +162,8 @@ class OriginalSubtitleDelivery:
             self.db.execute('INSERT OR IGNORE INTO subtitle_destination VALUES(?,?)', (event.history_id,identity))
 
     def _manifest(self, event):
+        if event.download_id is None:
+            raise _Blocked('held-unlinked-source')
         query = urlencode({'hashes': event.download_id})
         torrents = self.qbit.normalize_torrents(self.qbit.transport.request_json('GET', '/api/v2/torrents/info?' + query))
         matches = [r for r in torrents if r['hash'] == event.download_id]
@@ -361,10 +364,16 @@ class OriginalSubtitleDelivery:
                 events = self.sonarr.import_history_after(watermark)
                 with self.db:
                     for event in events:
-                        if not self.sonarr.accepts_import(event):
-                            continue
+                        accepted=self.sonarr.accepts_import(event)
                         payload = json.dumps(asdict(event), sort_keys=True)
-                        self.db.execute('INSERT OR IGNORE INTO subtitle_events(history_id,payload,status) VALUES(?,?,?)', (event.history_id,payload,'pending'))
+                        prior=self.db.execute('SELECT payload,status FROM subtitle_events WHERE history_id=?',(event.history_id,)).fetchone()
+                        if prior and prior[0]!=payload:
+                            raise ValueError('replayed import identity changed')
+                        if prior and (prior[1]=='skipped-outside-root')!=(not accepted):
+                            raise ValueError('replayed import disposition changed')
+                        if not prior:
+                            status=('held-unlinked-source' if event.download_id is None else 'pending') if accepted else 'skipped-outside-root'
+                            self.db.execute('INSERT INTO subtitle_events(history_id,payload,status) VALUES(?,?,?)', (event.history_id,payload,status))
                     if events:
                         self.db.execute("UPDATE subtitle_meta SET value=? WHERE key='watermark'", (str(max(watermark,max(e.history_id for e in events))),))
                 retry_cursor = int(self.db.execute("SELECT value FROM subtitle_meta WHERE key='retry_cursor'").fetchone()[0])
@@ -372,7 +381,7 @@ class OriginalSubtitleDelivery:
                 # required after verified delivery. Rotate unfinished work fairly
                 # and persist progress, so a large blocked cohort cannot starve
                 # later original subtitle completions after restart.
-                pending = self.db.execute("SELECT history_id,payload FROM subtitle_events WHERE status!='delivered' ORDER BY CASE WHEN history_id>? THEN 0 ELSE 1 END,history_id LIMIT 100", (retry_cursor,)).fetchall()
+                pending = self.db.execute("SELECT history_id,payload FROM subtitle_events WHERE status NOT IN ('delivered','held-unlinked-source','skipped-outside-root') ORDER BY CASE WHEN history_id>? THEN 0 ELSE 1 END,history_id LIMIT 100", (retry_cursor,)).fetchall()
                 for ident, payload in pending:
                     try:
                         self._deliver(ImportHistoryEvent(**json.loads(payload)))

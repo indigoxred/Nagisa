@@ -148,7 +148,8 @@ class SonarrClient:
                 try:
                     series_id = int(row["seriesId"])
                     episode_id = int(row["episodeId"])
-                    download_id = str(row["downloadId"]).lower()
+                    raw_download_id = row["downloadId"] if "downloadId" in row else None
+                    download_id = raw_download_id.lower() if isinstance(raw_download_id, str) else None
                     data = row["data"]
                     sonarr_file_id = int(data["fileId"])
                     imported_path = str(data["importedPath"])
@@ -161,8 +162,10 @@ class SonarrClient:
                     or sonarr_file_id <= 0 or source_size <= 0
                     or not imported_path.startswith("/") or not dropped_path.startswith("/")
                     or "\x00" in imported_path or "\x00" in dropped_path
-                    or len(download_id) != 40
-                    or any(c not in "0123456789abcdef" for c in download_id)
+                    or ("downloadId" in row and (
+                        download_id is None or len(download_id) != 40
+                        or any(c not in "0123456789abcdef" for c in download_id)
+                    ))
                 ):
                     raise ValueError("invalid Sonarr import history identity")
                 events.append(ImportHistoryEvent(

@@ -111,17 +111,16 @@ class ReconcilerService:
             watermark = self.state.watermark()
             new_events = self.sonarr.import_history_after(watermark)
             timestamp = self.now()
-            for event in new_events:
-                if self.sonarr.accepts_import(event):
-                    self.state.ingest_event(event, recorded_at=timestamp)
-                elif self.audit is not None:
+            dispositions = [(event, self.sonarr.accepts_import(event)) for event in new_events]
+            if dispositions:
+                self.state.ingest_import_window(dispositions, recorded_at=timestamp)
+            for event, accepted in dispositions:
+                if not accepted and self.audit is not None:
                     self.audit.record(
                         "reconciler", "event-skipped",
                         {"history_id": event.history_id, "series_id": event.series_id,
                          "reason": "outside-shoko-import-root"},
                     )
-            if new_events:
-                self.state.set_watermark(max(event.history_id for event in new_events))
             counts = {QueueStatus.READY: 0, QueueStatus.WAITING: 0, QueueStatus.BLOCKED: 0, QueueStatus.COMPLETED: 0}
             active_action_series: set[int] = set()
             for action in self.state.pending_actions():
@@ -222,6 +221,7 @@ class ReconcilerService:
                         "waiting": result.waiting,
                         "blocked": result.blocked,
                         "completed": result.completed,
+                        "held_unlinked_imports": self.state.held_unlinked_import_count(),
                     },
                 )
             return result
@@ -268,6 +268,7 @@ class ReconcilerService:
         return {
             "mode": self.mode,
             "watermark": self.state.watermark(),
+            "held_unlinked_imports": self.state.held_unlinked_import_count(),
             "pending_series": self.state.pending_series_ids(),
             "queues": queues,
         }
