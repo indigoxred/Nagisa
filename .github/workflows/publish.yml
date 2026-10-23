@@ -24,6 +24,8 @@ jobs:
         run: |
           python -m compileall -q src/nagisa
           PYTHONPATH=src python -m nagisa --help
+      - name: Test import reconciliation and arrival
+        run: PYTHONPATH=src python -m unittest discover -s tests -p 'test_*.py' -q
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435
       - name: Log in to GHCR
@@ -49,4 +51,3 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-

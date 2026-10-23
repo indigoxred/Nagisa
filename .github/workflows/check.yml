@@ -19,5 +19,7 @@ jobs:
         run: python -m compileall -q src/nagisa
       - name: Check CLI
         run: PYTHONPATH=src python -m nagisa --help
+      - name: Test import reconciliation and arrival
+        run: PYTHONPATH=src python -m unittest discover -s tests -p 'test_*.py' -q
       - name: Build image
         run: docker build -t nagisa:check .

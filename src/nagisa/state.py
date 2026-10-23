@@ -237,6 +237,43 @@ class ReconcilerState:
         )
         return cursor.rowcount == 1
 
+    def ingest_import_window(self, dispositions, *, recorded_at: str) -> int:
+        """Journal a complete Sonarr window and its cursor as one transaction."""
+        from nagisa.reconciler.models import ImportHistoryEvent
+        import json
+
+        with self._store.transaction("reconciler") as connection:
+            watermark = self.watermark()
+            for event, accepted in dispositions:
+                if not isinstance(event, ImportHistoryEvent) or type(accepted) is not bool:
+                    raise ValueError("typed import disposition required")
+                if type(event.history_id) is not int or event.history_id <= 0:
+                    raise ValueError("invalid import history identity")
+                payload = json.dumps({
+                    "history_id": event.history_id, "series_id": event.series_id,
+                    "episode_id": event.episode_id, "sonarr_file_id": event.sonarr_file_id,
+                    "download_id": event.download_id, "imported_path": event.imported_path,
+                    "dropped_path": event.dropped_path, "source_size": event.source_size,
+                }, sort_keys=True, separators=(",", ":"))
+                prior = connection.execute(
+                    "SELECT series_id,payload_json,status FROM reconciler_events WHERE history_id=?",
+                    (event.history_id,),
+                ).fetchone()
+                if prior:
+                    if prior["series_id"] != event.series_id or prior["payload_json"] != payload:
+                        raise ValueError("replayed import identity changed")
+                    if (prior["status"] == "skipped-outside-root") != (not accepted):
+                        raise ValueError("replayed import disposition changed")
+                else:
+                    status = ("pending" if event.download_id is not None else "held-unlinked-source") if accepted else "skipped-outside-root"
+                    connection.execute(
+                        "INSERT INTO reconciler_events(history_id,series_id,payload_json,status,fingerprint,first_seen_at,updated_at) VALUES(?,?,?,?,NULL,?,?)",
+                        (event.history_id, event.series_id, payload, status, recorded_at, recorded_at),
+                    )
+                watermark = max(watermark, event.history_id)
+            self.set_watermark(watermark)
+        return watermark
+
     @staticmethod
     def _latest_episode_payloads(payloads: list[dict]) -> list[dict]:
         """Return Sonarr's newest imported file for each exact episode.
@@ -258,7 +295,7 @@ class ReconcilerState:
 
     def pending_events_by_series(self) -> dict[int, list[dict]]:
         rows = self._store.connection.execute(
-            "SELECT history_id,series_id,payload_json,status,fingerprint FROM reconciler_events WHERE status NOT IN ('completed','action-issued','verification-blocked') ORDER BY history_id"
+            "SELECT history_id,series_id,payload_json,status,fingerprint FROM reconciler_events WHERE status NOT IN ('completed','action-issued','verification-blocked','held-unlinked-source','skipped-outside-root') ORDER BY history_id"
         )
         grouped: dict[int, list[dict]] = {}
         for row in rows:
@@ -271,6 +308,12 @@ class ReconcilerState:
 
     def pending_series_ids(self) -> tuple[int, ...]:
         return tuple(sorted(self.pending_events_by_series()))
+
+    def held_unlinked_import_count(self) -> int:
+        row = self._store.connection.execute(
+            "SELECT COUNT(*) FROM reconciler_events WHERE status='held-unlinked-source'"
+        ).fetchone()
+        return int(row[0])
 
     def series_status_rows(self) -> list[dict]:
         rows = self._store.connection.execute(
@@ -396,7 +439,7 @@ class ReconcilerState:
     def update_series(self, series_id: int, status: str, fingerprint: str | None,
                       *, updated_at: str) -> None:
         self._store.connection.execute(
-            "UPDATE reconciler_events SET status=?,fingerprint=?,updated_at=? WHERE series_id=? AND status NOT IN ('completed','action-issued')",
+            "UPDATE reconciler_events SET status=?,fingerprint=?,updated_at=? WHERE series_id=? AND status NOT IN ('completed','action-issued','held-unlinked-source','skipped-outside-root')",
             (status, fingerprint, updated_at, series_id),
         )
 
@@ -419,7 +462,7 @@ class ReconcilerState:
             claimed = connection.execute(
                 f"UPDATE reconciler_events SET status='action-issued',fingerprint=?,updated_at=?,action_id=? "
                 f"WHERE series_id=? AND history_id IN ({placeholders}) "
-                "AND status NOT IN ('completed','action-issued','verification-blocked')",
+                "AND status NOT IN ('completed','action-issued','verification-blocked','held-unlinked-source','skipped-outside-root')",
                 (fingerprint, created_at, action_id, series_id, *exact_history_ids),
             )
             if claimed.rowcount != len(exact_history_ids):

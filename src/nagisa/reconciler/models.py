@@ -20,7 +20,7 @@ class ImportHistoryEvent:
     series_id: int
     episode_id: int
     sonarr_file_id: int
-    download_id: str
+    download_id: str | None
     imported_path: str
     dropped_path: str
     source_size: int
