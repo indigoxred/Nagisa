@@ -155,10 +155,14 @@ class StockOwnerRecordReader:
 
 class StockPlexOwnerReader:
     """Bounded complete native owner reads; no guessed coordinates or refreshes."""
-    def __init__(self,plex,sections):
+    def __init__(self,plex,sections,*,batch_details=False,exact_guid_filter=False):
         self.plex=plex;self.sections=tuple(sections)
         if not self.sections or len(set(self.sections))!=len(self.sections) or any(type(s) is not int or s<=0 for s in self.sections):
             raise ValueError('distinct positive Plex sections required')
+        if type(batch_details) is not bool:raise ValueError('batch_details must be boolean')
+        if type(exact_guid_filter) is not bool:raise ValueError('exact_guid_filter must be boolean')
+        self.batch_details=batch_details
+        self.exact_guid_filter=exact_guid_filter
 
     def __call__(self,owner):
         import re,time
@@ -205,22 +209,68 @@ class StockPlexOwnerReader:
                 if key(item['ratingKey'])!=identity or item['type']!=kind or int(item['librarySectionID'])!=section or item.get('deletedAt'):
                     raise PreservationError('native owner detail identity differs')
                 return item
+            def details(identities,kind,section):
+                identities=[key(identity) for identity in identities]
+                if len(identities)!=len(set(identities)):
+                    raise PreservationError('duplicate native owner detail key')
+                if not self.batch_details:
+                    return {identity:detail(identity,kind,section) for identity in identities}
+                found={}
+                for start in range(0,len(identities),50):
+                    chunk=identities[start:start+50]
+                    rows=get('/library/metadata/'+','.join(chunk)+'?includeGuids=1&skipRefresh=1').get('Metadata')
+                    if not isinstance(rows,list) or len(rows)!=len(chunk):
+                        raise PreservationError('native owner batch detail incomplete')
+                    expected=set(chunk)
+                    for item in rows:
+                        if not isinstance(item,dict):
+                            raise PreservationError('native owner batch detail malformed')
+                        identity=key(item['ratingKey'])
+                        if (identity not in expected or identity in found or item.get('type')!=kind
+                                or int(item['librarySectionID'])!=section or item.get('deletedAt')):
+                            raise PreservationError('native owner batch detail identity differs')
+                        found[identity]=item
+                if set(found)!=set(identities):
+                    raise PreservationError('native owner batch detail keys differ')
+                return found
             show_guid=f'tv.plex.agents.custom.shoko://show/{owner}'
             sections={}
             for section in self.sections:
-                shows=page(f'/library/sections/{section}/all?type=2&includeGuids=1')
+                show_path=f'/library/sections/{section}/all?type=2&includeGuids=1'
+                if self.exact_guid_filter:
+                    shows=page(show_path+'&'+urlencode({'guid':show_guid}))
+                    if any(row.get('guid')!=show_guid for row in shows):
+                        # Some Plex servers ignore the filter. Trust only an
+                        # exact owner found by the complete stock census.
+                        shows=page(show_path)
+                        if not any(row.get('guid')==show_guid for row in shows):
+                            raise PreservationError('native Plex GUID filter returned unrelated owner')
+                    if not shows:
+                        # Do not infer absence from an unsupported or stale
+                        # filter response; complete the original stock census.
+                        shows=page(show_path)
+                else:
+                    shows=page(show_path)
                 matches=[row for row in shows if row.get('guid')==show_guid]
                 if len(matches)>1:raise PreservationError('native owner show ambiguous')
                 if not matches:sections[section]=[];continue
                 show=detail(matches[0]['ratingKey'],'show',section)
                 if show.get('guid')!=show_guid:raise PreservationError('native owner show changed')
                 rows=page('/library/metadata/'+key(show['ratingKey'])+'/allLeaves?includeGuids=1')
+                episode_details=(details([row['ratingKey'] for row in rows],'episode',section)
+                                 if self.batch_details else None)
+                season_details=(details(sorted({key(item['parentRatingKey'])
+                                               for item in episode_details.values()}),
+                                        'season',section) if self.batch_details else None)
                 items=[];seasons={}
                 for row in rows:
-                    item=detail(row['ratingKey'],'episode',section)
+                    item=(episode_details[key(row['ratingKey'])] if episode_details is not None
+                          else detail(row['ratingKey'],'episode',section))
                     if key(item['grandparentRatingKey'])!=key(show['ratingKey']):raise PreservationError('native episode belongs to other owner')
                     season_key=key(item['parentRatingKey'])
-                    if season_key not in seasons:seasons[season_key]=detail(season_key,'season',section)
+                    if season_key not in seasons:
+                        seasons[season_key]=(season_details[season_key] if season_details is not None
+                                             else detail(season_key,'season',section))
                     season=seasons[season_key]
                     if key(season['parentRatingKey'])!=key(show['ratingKey']) or type(season['index']) is not int or season['index']<0 or type(item['parentIndex']) is not int or item['parentIndex']!=season['index'] or type(item['index']) is not int or item['index']<0:
                         raise PreservationError('native episode season association differs')

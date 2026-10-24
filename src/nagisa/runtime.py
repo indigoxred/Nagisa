@@ -101,6 +101,7 @@ class NagisaRuntime:
         self.subtitles = subtitles
         self.catchup = catchup
         self.seerr_availability = None
+        self.file_event_worker = None
         self._delivery_dispatch_lock = threading.Lock()
         self._seerr_availability_lock = threading.Lock()
         self.config = config
@@ -213,6 +214,7 @@ class NagisaRuntime:
                 seerr_app = build_seerr_app(config, config.seerr_guard_config_file, self.audit)
             if seerr_app is not None:
                 self.seerr_availability = getattr(seerr_app, 'availability_sweep', None)
+                self.file_event_worker = getattr(seerr_app, 'file_event_worker', None)
             app = NagisaWebApp(self, shoko_origin=config.shoko_url,
                                seerr_app=seerr_app)
             self.web = NagisaWebServer(app, config.bind_host, config.port)
@@ -231,13 +233,14 @@ class NagisaRuntime:
 
     @classmethod
     def for_tests(cls, *, ordering: Any, reconciler: Any, web: Any,
-                  future_guard: Any | None = None, arrival=None, subtitles=None, catchup=None, delivery_settings=None, movie_arrival=None) -> "NagisaRuntime":
+                  future_guard: Any | None = None, arrival=None, subtitles=None, catchup=None, delivery_settings=None, movie_arrival=None, file_event_worker=None) -> "NagisaRuntime":
         instance = cls.__new__(cls)
         instance.arrival = arrival
         instance.movie_arrival = movie_arrival
         instance.subtitles = subtitles
         instance.catchup = catchup
         instance.seerr_availability = None
+        instance.file_event_worker = file_event_worker
         instance._delivery_dispatch_lock = threading.Lock()
         instance._seerr_availability_lock = threading.Lock()
         instance.delivery_settings = delivery_settings
@@ -265,6 +268,10 @@ class NagisaRuntime:
         self._seerr_availability_interval = (
             self.seerr_availability.poll_seconds
             if self.seerr_availability is not None else None)
+        self._file_event_review_interval = (
+            15 if self.file_event_worker is not None else None)
+        self._file_event_catchup_interval = (
+            300 if self.file_event_worker is not None else None)
         self._stop = threading.Event()
         self._threads: list[threading.Thread] = []
         self._started = False
@@ -286,6 +293,33 @@ class NagisaRuntime:
         if self.seerr_availability is not None:
             self.module_health['seerr_availability'] = {
                 'ok': True, 'error': None, 'last_cycle': None}
+        if self.file_event_worker is not None:
+            self.module_health['file_event_review'] = {
+                'ok': True, 'error': None, 'last_cycle': None}
+            self.module_health['file_event_catchup'] = {
+                'ok': True, 'error': None, 'last_cycle': None}
+
+    def tick_file_event_review(self) -> None:
+        if self.file_event_worker is None:
+            return
+        try:
+            self.file_event_worker.review_pending_once()
+        except Exception as error:
+            self._record_health('file_event_review',
+                                RuntimeError(type(error).__name__))
+        else:
+            self._record_health('file_event_review', None)
+
+    def tick_file_event_catchup(self) -> None:
+        if self.file_event_worker is None:
+            return
+        try:
+            self.file_event_worker.check_recent_once()
+        except Exception as error:
+            self._record_health('file_event_catchup',
+                                RuntimeError(type(error).__name__))
+        else:
+            self._record_health('file_event_catchup', None)
 
     def tick_seerr_availability(self) -> None:
         if self.seerr_availability is None:
@@ -431,8 +465,19 @@ class NagisaRuntime:
             if self.seerr_availability is not None:
                 workers += (('seerr-availability', self.tick_seerr_availability,
                              self._seerr_availability_interval),)
+            if self.file_event_worker is not None:
+                workers += (('file-event-review', self.tick_file_event_review,
+                             self._file_event_review_interval),)
+                workers += (('file-event-catchup', self.tick_file_event_catchup,
+                             self._file_event_catchup_interval),)
             for name, callback, interval in workers:
                 thread = threading.Thread(target=self._loop, args=(callback, interval), name=f"nagisa-{name}", daemon=True)
+                thread.start()
+                self._threads.append(thread)
+            if self.file_event_worker is not None:
+                thread = threading.Thread(
+                    target=self.file_event_worker.run_forever,
+                    name='nagisa-file-event-connection', daemon=True)
                 thread.start()
                 self._threads.append(thread)
         self._started = True
@@ -441,6 +486,8 @@ class NagisaRuntime:
         if self._stopped:
             return
         self._stop.set()
+        if self.file_event_worker is not None:
+            self.file_event_worker.stop()
         for thread in self._threads:
             thread.join(timeout=5)
         self.web.stop()
@@ -469,12 +516,16 @@ class NagisaRuntime:
         database_ok = True if self.state is None else self.state.quick_check() == "ok"
         web_ok = bool(getattr(self.web, "is_alive", False))
         modules_ok = all(row["ok"] for row in self.module_health.values())
+        feed = (None if self.file_event_worker is None
+                else self.file_event_worker.snapshot())
+        feed_ok = feed is None or (feed['connected'] and not feed['stopped'])
         return {
-            "healthy": database_ok and web_ok and modules_ok,
+            "healthy": database_ok and web_ok and modules_ok and feed_ok,
             "app_version": __version__,
             "state_schema": SCHEMA_VERSION,
             "database": "ok" if database_ok else "failed",
             "web": web_ok,
+            "file_feed": feed,
             **self.module_health,
         }
 

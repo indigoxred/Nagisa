@@ -23,6 +23,21 @@ _FIELDS = frozenset({
 })
 
 
+def attach_hidden_feed(config: Any, settings: dict, app: Any,
+                       shoko: Any, plex: Any, seerr: Any,
+                       part_probe: Any, folder_bindings: list) -> list:
+    """Attach only the explicitly configured stock-Plex file feed."""
+    app.file_event_worker = None
+    hidden = settings.get('hidden_feed')
+    if hidden is None:
+        return folder_bindings
+    from nagisa.seerr_hidden_feed_startup import build_configured_tmdb_feed
+    worker, bindings = build_configured_tmdb_feed(
+        config, shoko, plex, seerr, hidden, part_probe)
+    app.file_event_worker = worker
+    return folder_bindings + list(bindings)
+
+
 def require_prevent_search(seerr: Any, service_id: int) -> None:
     """Check the exact stock Seerr service before accepting anime requests."""
     if type(service_id) is not int or service_id <= 0:
@@ -73,7 +88,7 @@ def build_seerr_app(config: Any, settings_path: str | Path | None,
     if (not isinstance(settings, dict) or not _FIELDS.issubset(settings)
             or not set(settings).issubset(_FIELDS | {
                 'availability', 'exact_ids', 'published_mappings',
-                'seerr_sonarr_service_id'})):
+                'seerr_sonarr_service_id', 'hidden_feed'})):
         raise ValueError('Seerr guard settings are incomplete or unexpected')
     seerr_url = _origin(settings['seerr_url'])
     token_file = _private_file(settings['seerr_token_file'], root, 4096)
@@ -281,5 +296,8 @@ def build_seerr_app(config: Any, settings_path: str | Path | None,
                 server_id=availability['server_id'],
                 poll_seconds=availability['poll_seconds'],
                 max_per_cycle=availability['max_per_cycle'])
+    folder_bindings = attach_hidden_feed(
+        config, settings, app, shoko, plex, seerr, probe_part,
+        folder_bindings)
     app.folder_bindings = tuple(folder_bindings)
     return app
