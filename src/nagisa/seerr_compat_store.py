@@ -284,6 +284,23 @@ class CompatibilityLinkStore:
             raise ValueError('owned mapping file page changed')
         return ids
 
+    def owned_series_ids_after(self, last_series_id: int,
+                               limit: int) -> tuple[int, ...]:
+        """Page series with an owned or contested claim for bounded rechecks."""
+        if (type(last_series_id) is not int or last_series_id < 0
+                or type(limit) is not int or not 1 <= limit <= 25):
+            raise ValueError('bounded owned series page required')
+        with self._connect() as db:
+            rows = db.execute('''SELECT series_id FROM links
+                WHERE series_id > ? UNION SELECT series_id FROM contested_claims
+                WHERE series_id > ? ORDER BY series_id LIMIT ?''',
+                (last_series_id, last_series_id, limit)).fetchall()
+        ids = tuple(row['series_id'] for row in rows)
+        if any(type(item) is not int or item <= last_series_id
+               for item in ids):
+            raise ValueError('owned series page changed')
+        return ids
+
     def owned_file_ids_for_shows(self, show_ids: tuple[int, ...]) -> tuple[int, ...]:
         """Read exact owned and contested IDs for a targeted mapping recheck."""
         if (not isinstance(show_ids, tuple) or len(show_ids) > 100

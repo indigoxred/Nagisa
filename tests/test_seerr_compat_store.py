@@ -58,6 +58,7 @@ class CompatibilityPlexHintTests(unittest.TestCase):
                 db.close()
             self.assertEqual(store.owned_file_ids_after(0, 1), (11,))
             self.assertEqual(store.owned_file_ids_after(11, 2), (12,))
+            self.assertEqual(store.owned_series_ids_after(0, 2), (1,))
 
     def test_mapping_update_reads_owned_and_contested_ids_for_exact_shows(self):
         with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as directory:

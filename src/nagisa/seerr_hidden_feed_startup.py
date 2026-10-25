@@ -11,6 +11,7 @@ from .seerr_compat_events import CompatibilityLinkEvents
 from .seerr_compat_census import ShokoInitialCensus
 from .seerr_compat_links import LinkProofReader
 from .seerr_compat_mapping_audit import OwnedMappingAudit
+from .seerr_compat_series_recheck import ScopedSeriesRecheck, OwnedSeriesAudit
 from .seerr_compat_owned_audit import OwnedDeletionAudit
 from .seerr_compat_plex_refresh import VerifiedShowRefresh
 from .seerr_compat_store import CompatibilityLinkStore
@@ -55,6 +56,16 @@ def build_tmdb_event_worker(config: Any, shoko: Any, reader: LinkProofReader,
         reader, store, pending, write_enabled=settings['mode'] == 'apply',
         refresh=refresh,
         refresh_debounce_seconds=settings.get('refresh_debounce_seconds', 30))
+    series_journal = JsonSessionJournal(
+        root / 'seerr-compat-tmdb-series-recheck.json')
+    series_recheck = ScopedSeriesRecheck(
+        shoko, processor, series_journal, batch_size=5)
+    processor.attach_series_recheck(series_recheck)
+    series_audit_journal = JsonSessionJournal(
+        root / 'seerr-compat-tmdb-series-audit.json')
+    series_audit = OwnedSeriesAudit(
+        store, series_recheck, series_audit_journal,
+        batch_size=5, interval_seconds=600)
     recent = ShokoRecentCatchup(
         shoko, page_size=settings.get('page_size', 100),
         max_pages=settings.get('max_pages', 5))
@@ -69,18 +80,24 @@ def build_tmdb_event_worker(config: Any, shoko: Any, reader: LinkProofReader,
 
     def client_factory() -> ShokoLongPoll:
         http = ShokoLongPollHttp(config.shoko_url, config.shoko_token)
-        return ShokoLongPoll(http, processor, catchup)
+        return ShokoLongPoll(http, processor, catchup, feeds='file,metadata')
 
     # Five reviews per 15-second runtime tick clear a 25-file mapping slice
     # in 75 seconds while leaving room for new Shoko file notices.
     worker = ShokoEventWorker(
-        client_factory, processor, catchup=catchup, review_limit=5)
+        client_factory, processor, catchup=catchup,
+        series_recheck=series_recheck, series_audit=series_audit,
+        review_limit=5)
     access = 'read/write' if settings['mode'] == 'apply' else 'read-only'
     bindings = (
         (str(store.root), 'Nagisa private Plex TMDB source', access),
         (str(pending.path), 'Private feed pending Shoko file IDs', 'read/write'),
         (str(cursor.path), 'Private feed Shoko import cursor', 'read/write'),
         (str(backlog.path), 'Private feed catch-up backlog', 'read/write'),
+        (str(series_journal.path), 'Private TMDB series recheck queue',
+         'read/write'),
+        (str(series_audit_journal.path), 'Private TMDB series audit cursor',
+         'read/write'),
     )
     return worker, bindings
 

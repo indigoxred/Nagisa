@@ -59,14 +59,17 @@ class ShokoLongPollHttp:
 
 
 class ShokoLongPoll:
-    def __init__(self, http: Any, processor: Any, catchup: Any) -> None:
+    def __init__(self, http: Any, processor: Any, catchup: Any, *,
+                 feeds: str = 'file') -> None:
         if (not callable(getattr(http, 'request', None))
                 or not callable(getattr(processor, 'ingest', None))
-                or not callable(getattr(catchup, 'run_once', None))):
+                or not callable(getattr(catchup, 'run_once', None))
+                or feeds not in ('file', 'file,metadata')):
             raise ValueError('Shoko event transport requires catch-up')
         self.http = http
         self.processor = processor
         self.catchup = catchup
+        self.feeds = feeds
         self._token: str | None = None
         self._state_lock = threading.Lock()
         self._closed = False
@@ -125,7 +128,7 @@ class ShokoLongPoll:
         try:
             # ASP.NET uses the first GET to establish LongPolling; it returns
             # immediately and carries no hub payload.
-            status, first = self._request('GET', _HUB + '?feeds=file&id='
+            status, first = self._request('GET', _HUB + '?feeds=' + self.feeds + '&id='
                                           + quote(self._token, safe=''), timeout=30)
             self._require_open()
             if status != 200 or first:
