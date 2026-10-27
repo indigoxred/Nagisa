@@ -2,11 +2,14 @@
 
 import tempfile
 from copy import deepcopy
+from types import SimpleNamespace
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from nagisa.seerr_compat_links import LinkProofReader, NotRegularTVFile, SeerrEpisodeResolver
+from nagisa.seerr_compat_links import (
+    LinkProofReader, NotRegularTVFile, OwnedPublishedCoordinate,
+    SeerrEpisodeResolver)
 
 
 class FakeShoko:
@@ -23,6 +26,7 @@ class FakeShoko:
         self.tmdb_hidden = False
         self.tmdb_duplicate = False
         self.tmdb_total_override = None
+        self.extra_episode_rows = []
 
     def request_json(self, method, path):
         assert method == 'GET'
@@ -42,7 +46,8 @@ class FakeShoko:
                                  'Show': [94404], 'Episode': [1948394],
                                  'Movie': []}},
                      'AniDB': {'ID': 225738, 'Type': self.episode_type,
-                               'EpisodeNumber': 5}}]
+                               'EpisodeNumber': 5}},
+                    *deepcopy(self.extra_episode_rows)]
         if path == '/api/v3/ManagedFolder/2':
             return {'ID': 2, 'Path': str(self.root) + '/',
                     'DropFolderType': 'Destination'}
@@ -88,13 +93,17 @@ class FakeSeerr:
     def __init__(self):
         self.season_number = 1
         self.episode_number = 5
+        self.episode_id = 7398592
         self.duplicate = False
         self.special_duplicate_coordinates = False
+        self.anime_provider = 'tvdb'
+        self.calls = []
 
     def request_json(self, method, path):
         assert method == 'GET'
+        self.calls.append(path)
         if path == '/api/v1/settings/metadatas':
-            return {'anime': 'tvdb'}
+            return {'anime': self.anime_provider}
         if path == '/api/v1/tv/94404':
             seasons = [{'seasonNumber': self.season_number,
                         'episodeCount': 1}]
@@ -105,7 +114,7 @@ class FakeSeerr:
             return {'id': 94404, 'externalIds': {'tvdbId': 370761},
                     'seasons': seasons}
         if path == f'/api/v1/tv/94404/season/{self.season_number}':
-            return {'episodes': [{'id': 7398592,
+            return {'episodes': [{'id': self.episode_id,
                                   'seasonNumber': self.season_number,
                                   'episodeNumber': self.episode_number}]}
         if self.duplicate and path == '/api/v1/tv/94404/season/17':
@@ -120,8 +129,9 @@ class FakeSeerr:
 
 
 def card(section, *, file_id=42, episode_id=99, season=1, episode=5,
-         part_path=None):
-    return {'guid': f'tv.plex.agents.custom.shoko://episode/e{episode_id}',
+         part_path=None, part_index=None):
+    suffix = f'p{part_index}' if part_index is not None else ''
+    return {'guid': f'tv.plex.agents.custom.shoko://episode/e{episode_id}{suffix}',
             'index': episode, 'parentIndex': season,
             'grandparentRatingKey': '1002' if section == 102 else '1003',
             'Media': [{'Part': [{
@@ -235,6 +245,212 @@ class LinkProofReaderTests(unittest.TestCase):
         self.assertEqual(proof.plex_target,
                          '/source-pure/Anime/Show/episode.mkv')
 
+    def test_bounded_owner_snapshot_reuses_and_invalidates_source(self):
+        calls = []
+
+        def owner(series_id):
+            calls.append(series_id)
+            return deepcopy(self.cards)
+
+        reader = LinkProofReader(
+            self.shoko, owner, self.plex, self.seerr,
+            sections=(102, 103),
+            allowed_folders={2: (self.root, '/source-pure/Anime')},
+            part_probe=lambda _: True, coordinate_mode='tvdb',
+            owner_cache_size=128)
+        reader.read(42)
+        reader.read(42)
+        self.assertEqual(calls, [1051])
+        self.cards = {section: [card(section, file_id=43)]
+                      for section in (102, 103)}
+        reader.invalidate_owner_cache()
+        with self.assertRaises(ValueError):
+            reader.read(42)
+        self.assertEqual(calls, [1051, 1051])
+
+    def test_bounded_shoko_provider_snapshot_reuses_and_invalidates_source(self):
+        calls = []
+        original = self.shoko.request_json
+
+        def request(method, path):
+            if path == '/api/v3/Tmdb/Show/94404/Episode?page=1&pageSize=0':
+                calls.append(path)
+            return original(method, path)
+
+        self.shoko.request_json = request
+        reader = LinkProofReader(
+            self.shoko, lambda _: deepcopy(self.cards), self.plex,
+            self.seerr, sections=(102, 103),
+            allowed_folders={2: (self.root, '/source-pure/Anime')},
+            part_probe=lambda _: True, coordinate_mode='tvdb',
+            provider_cache_size=128)
+        reader.read(42)
+        reader.read(42)
+        self.assertEqual(len(calls), 1)
+        self.shoko.tvdb_episode_id = 8888888
+        reader.invalidate_owner_cache()
+        with self.assertRaisesRegex(ValueError, 'absent'):
+            reader.read(42)
+        self.assertEqual(len(calls), 2)
+
+    def test_shoko_provider_epoch_rejects_same_count_identity_change(self):
+        reader = LinkProofReader(
+            self.shoko, lambda _: deepcopy(self.cards), self.plex,
+            self.seerr, sections=(102, 103),
+            allowed_folders={2: (self.root, '/source-pure/Anime')},
+            part_probe=lambda _: True, coordinate_mode='tvdb',
+            provider_cache_size=128)
+        reader.read(42)
+        self.shoko.tvdb_episode_id = 8888888
+        with self.assertRaisesRegex(ValueError, 'Shoko provider changed'):
+            reader.revalidate_provider_snapshots()
+
+    def test_cached_public_show_and_folder_identity_revalidates(self):
+        shoko_calls = []
+        plex_calls = []
+        shoko_get = self.shoko.request_json
+        plex_get = self.plex.request_json
+
+        def counted_shoko(method, path):
+            shoko_calls.append(path)
+            return shoko_get(method, path)
+
+        def counted_plex(method, path):
+            plex_calls.append(path)
+            return plex_get(method, path)
+
+        self.shoko.request_json = counted_shoko
+        self.plex.request_json = counted_plex
+        reader = LinkProofReader(
+            self.shoko, lambda _: deepcopy(self.cards), self.plex,
+            self.seerr, sections=(102, 103),
+            allowed_folders={2: (self.root, '/source-pure/Anime')},
+            part_probe=lambda _: True, coordinate_mode='tvdb',
+            owner_cache_size=128, provider_cache_size=128)
+        reader.read(42)
+        reader.read(42)
+        self.assertEqual(shoko_calls.count('/api/v3/ManagedFolder/2'), 1)
+        self.assertEqual(sum(path.startswith('/library/metadata/100')
+                             for path in plex_calls), 2)
+        self.plex.tmdb_id = 123456
+        with self.assertRaisesRegex(ValueError, 'public Plex show changed'):
+            reader.revalidate_provider_snapshots()
+
+    def test_cached_managed_folder_revalidation_detects_changed_root(self):
+        reader = LinkProofReader(
+            self.shoko, lambda _: deepcopy(self.cards), self.plex,
+            self.seerr, sections=(102, 103),
+            allowed_folders={2: (self.root, '/source-pure/Anime')},
+            part_probe=lambda _: True, coordinate_mode='tvdb',
+            owner_cache_size=128, provider_cache_size=128)
+        reader.read(42)
+        self.shoko.root = self.root.parent / 'Different'
+        with self.assertRaisesRegex(ValueError, 'managed-folder root changed'):
+            reader.revalidate_provider_snapshots()
+
+    def test_regular_file_with_one_attached_special_keeps_exact_regular_link(self):
+        for special_episode_ids in ([], [1948395]):
+            with self.subTest(special_episode_ids=special_episode_ids):
+                self.shoko.extra_episode_rows = [{
+                    'IDs': {'ID': 100, 'ParentSeries': 1051,
+                            'AniDB': 225739, 'TMDB': {
+                                'Show': [94404] if special_episode_ids else [],
+                                'Episode': special_episode_ids, 'Movie': []}},
+                    'AniDB': {'ID': 225739, 'Type': 'Special',
+                              'EpisodeNumber': 1}}]
+                proof = self.reader(coordinate_mode='tmdb').read(42)
+                self.assertEqual((proof.shoko_file_id, proof.shoko_episode_id,
+                                  proof.tmdb_episode_id, proof.season,
+                                  proof.episode), (42, 99, 1948394, 2, 3))
+                self.assertEqual(len(self.shoko.extra_episode_rows), 1)
+
+    def test_tvdb_stage_projects_regular_despite_distinct_linked_special(self):
+        self.shoko.extra_episode_rows = [{
+            'IDs': {'ID': 100, 'ParentSeries': 1051,
+                    'AniDB': 225739, 'TMDB': {
+                        'Show': [94404], 'Episode': [1948395], 'Movie': []}},
+            'AniDB': {'ID': 225739, 'Type': 'Special',
+                      'EpisodeNumber': 1}}]
+
+        proof = self.reader(coordinate_mode='tvdb').read(42)
+        self.assertEqual((proof.shoko_episode_id, proof.tmdb_episode_id,
+                          proof.tvdb_episode_id, proof.season, proof.episode),
+                         (99, 1948394, 7398592, 1, 5))
+        self.assertEqual((self.shoko.tmdb_season, self.shoko.tmdb_episode),
+                         (2, 3))
+
+        self.shoko.tvdb_episode_id = 8000000
+        with self.assertRaisesRegex(ValueError, 'exact TVDB episode absent'):
+            self.reader(coordinate_mode='tvdb').read(42)
+
+    def test_attached_special_must_be_distinct_same_series_nonmovie(self):
+        special = {'IDs': {'ID': 100, 'ParentSeries': 1051,
+                           'AniDB': 225739, 'TMDB': {
+                               'Show': [], 'Episode': [], 'Movie': []}},
+                   'AniDB': {'ID': 225739, 'Type': 'Special',
+                             'EpisodeNumber': 1}}
+        for mutation in (
+                lambda row: row['IDs'].update(ParentSeries=1052),
+                lambda row: row['IDs'].update(ID=99),
+                lambda row: row['AniDB'].update(Type='Episode'),
+                lambda row: row['IDs']['TMDB'].update(Movie=[1418665])):
+            with self.subTest(mutation=mutation):
+                row = deepcopy(special)
+                mutation(row)
+                self.shoko.extra_episode_rows = [row]
+                with self.assertRaisesRegex(ValueError, 'ambiguous'):
+                    self.reader(coordinate_mode='tmdb').read(42)
+
+    def test_attached_special_cannot_turn_a_public_special_card_into_tv(self):
+        self.shoko.extra_episode_rows = [{
+            'IDs': {'ID': 100, 'ParentSeries': 1051,
+                    'AniDB': 225739, 'TMDB': {
+                        'Show': [], 'Episode': [], 'Movie': []}},
+            'AniDB': {'ID': 225739, 'Type': 'Special', 'EpisodeNumber': 1}}]
+        self.cards = {section: [card(section, episode_id=100)]
+                      for section in (102, 103)}
+        with self.assertRaisesRegex(ValueError, 'Plex episode'):
+            self.reader(coordinate_mode='tmdb').read(42)
+
+    def test_relay_part_guid_requires_exact_native_episode_coordinate(self):
+        self.cards = {section: [card(section, part_index=2)]
+                      for section in (102, 103)}
+        self.shoko.tmdb_season = 1
+        self.shoko.tmdb_episode = 5
+        proof = self.reader(coordinate_mode='tmdb').read(42)
+        self.assertEqual((proof.shoko_episode_id, proof.tmdb_episode_id,
+                          proof.season, proof.episode), (99, 1948394, 1, 5))
+
+        self.shoko.tmdb_episode = 6
+        with self.assertRaisesRegex(ValueError, 'part|coordinate'):
+            self.reader(coordinate_mode='tmdb').read(42)
+        self.shoko.tmdb_episode = 5
+        with self.assertRaisesRegex(ValueError, 'Plex episode'):
+            self.reader(coordinate_mode='tvdb').read(42)
+        self.cards[103] = [card(103)]
+        with self.assertRaisesRegex(ValueError, 'part|Plex episode|mirrored Plex identity'):
+            self.reader(coordinate_mode='tmdb').read(42)
+
+    def test_relay_part_card_with_an_alternate_file_selects_exact_part(self):
+        self.shoko.tmdb_season = 1
+        self.shoko.tmdb_episode = 5
+        alternate = '/anime-native/!Relay/1051/Season 1/S01E05 [43].mkv'
+        for section in (102, 103):
+            episode_card = card(section, part_index=2)
+            episode_card['Media'].append({'Part': [{
+                'file': alternate, 'size': 11}]})
+            self.cards[section] = [episode_card]
+
+        proof = self.reader(coordinate_mode='tmdb').read(42)
+        self.assertEqual((proof.shoko_file_id, proof.shoko_episode_id,
+                          proof.plex_target),
+                         (42, 99, '/source-pure/Anime/Show/episode.mkv'))
+
+        self.cards[103][0]['Media'][1]['Part'][0]['file'] = (
+            '/anime-native/!Relay/1051/Season 1/duplicate [42].mkv')
+        with self.assertRaisesRegex(ValueError, 'Plex episode'):
+            self.reader(coordinate_mode='tmdb').read(42)
+
     def test_real_anime_section_alone_proves_playable_file(self):
         proof = self.reader(sections=(102,)).read(42)
         self.assertEqual((proof.shoko_file_id, proof.tvdb_show_id),
@@ -332,15 +548,56 @@ class LinkProofReaderTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'TVDB episode identity'):
             self.reader().read(42)
         calls = []
-        def published(*, tmdb_show_id, tvdb_show_id, shoko_series_id,
+        def published(*, file_id, tmdb_episode_id, plex_target,
+                      tmdb_show_id, tvdb_show_id, shoko_series_id,
                       anidb_episode_id):
-            calls.append((tmdb_show_id, tvdb_show_id, shoko_series_id,
+            calls.append((file_id, tmdb_episode_id, plex_target,
+                          tmdb_show_id, tvdb_show_id, shoko_series_id,
                           anidb_episode_id))
             return 1, 5
         proof = self.reader(published_resolver=published).read(42)
-        self.assertEqual(calls, [(94404, 370761, 1051, 225738)])
+        self.assertEqual(calls, [(42, 1948394, '/source-pure/Anime/Show/episode.mkv',
+                                  94404, 370761, 1051, 225738)])
         self.assertEqual((proof.tvdb_episode_id, proof.season, proof.episode),
                          (None, 1, 5))
+
+    def test_no_id_fallback_requires_same_ready_owned_link(self):
+        row = {'file_id': 42, 'series_id': 1051,
+               'anidb_episode_id': 225738, 'tmdb_episode_id': 1948394,
+               'tmdb_show_id': 94404, 'tvdb_episode_id': None,
+               'slot': '94404/1/5', 'state': 'ready',
+               'target': '/source-pure/Anime/Show/episode.mkv',
+               'link': 'tmdb-94404/Season 01/S01E05.mkv'}
+        store = SimpleNamespace(identity_provider='tmdb', root=self.root.parent,
+                                lookup_file=lambda file_id: row)
+        resolver = OwnedPublishedCoordinate(store)
+        arguments = {'file_id': 42, 'tmdb_episode_id': 1948394,
+                     'plex_target': row['target'], 'tmdb_show_id': 94404,
+                     'tvdb_show_id': 370761, 'shoko_series_id': 1051,
+                     'anidb_episode_id': 225738}
+        with patch.object(Path, 'is_symlink', return_value=True), patch(
+                'nagisa.seerr_compat_links.os.readlink', return_value=row['target']):
+            self.assertEqual(resolver(**arguments), (1, 5))
+            self.shoko.tvdb_episode_id = None
+            proof = self.reader(published_resolver=resolver).read(42)
+            self.assertEqual((proof.tvdb_episode_id, proof.season, proof.episode),
+                             (None, 1, 5))
+            for key, bad in [('file_id', 43), ('tmdb_episode_id', 1948395),
+                             ('plex_target', '/source-pure/other.mkv'),
+                             ('shoko_series_id', 1052),
+                             ('anidb_episode_id', 225739)]:
+                changed = dict(arguments, **{key: bad})
+                self.assertIsNone(resolver(**changed))
+            row['tvdb_episode_id'] = 111
+            self.assertIsNone(resolver(**arguments))
+            row['tvdb_episode_id'] = None
+            row['state'] = 'pending'
+            self.assertIsNone(resolver(**arguments))
+
+    def test_malformed_crosswalk_cannot_be_treated_as_missing(self):
+        self.shoko.tvdb_episode_id = 'bad-id'
+        with self.assertRaisesRegex(ValueError, 'malformed TVDB cross-reference'):
+            self.reader(published_resolver=lambda **_: (1, 5)).read(42)
 
     def test_published_coordinate_conflicting_with_seerr_is_held(self):
         self.shoko.tvdb_episode_id = None
@@ -348,11 +605,25 @@ class LinkProofReaderTests(unittest.TestCase):
             self.reader(published_resolver=lambda **_:
                         (1, 6)).read(42)
 
-    def test_native_crosswalk_must_agree_with_published_episode(self):
-        with self.assertRaisesRegex(ValueError, 'published.*crosswalk'):
-            self.reader(published_resolver=lambda **_: (0, 38)).read(42)
-        proof = self.reader(published_resolver=lambda **_: (1, 5)).read(42)
+    def test_exact_native_id_can_move_from_old_published_slot(self):
+        calls = []
+        def stale_published(**kwargs):
+            calls.append(kwargs)
+            return 1, 9
+        proof = self.reader(published_resolver=stale_published).read(42)
         self.assertEqual((proof.season, proof.episode), (1, 5))
+        self.assertEqual(calls, [])
+
+    def test_supplied_stale_id_does_not_downgrade_to_old_slot_fallback(self):
+        self.shoko.tvdb_episode_id = 8261901
+        self.seerr.episode_id = 8515643
+        calls = []
+        def old_published(**kwargs):
+            calls.append(kwargs)
+            return 1, 5
+        with self.assertRaisesRegex(ValueError, 'exact TVDB episode absent'):
+            self.reader(published_resolver=old_published).read(42)
+        self.assertEqual(calls, [])
 
     def test_unique_native_crosswalk_survives_unavailable_published_coordinate(self):
         proof = self.reader(published_resolver=lambda **_: None).read(42)
@@ -375,6 +646,113 @@ class LinkProofReaderTests(unittest.TestCase):
         self.seerr.special_duplicate_coordinates = True
         with self.assertRaisesRegex(ValueError, 'regular'):
             SeerrEpisodeResolver(self.seerr).resolve(94404, 370761, 880001)
+
+    def test_provider_snapshot_reuses_one_complete_show_fetch(self):
+        resolver = SeerrEpisodeResolver(self.seerr, cache_seconds=3600)
+        self.assertEqual(resolver.resolve(94404, 370761, 7398592), (1, 5))
+        self.assertEqual(resolver.resolve(94404, 370761, 7398592), (1, 5))
+        self.assertEqual(self.seerr.calls.count('/api/v1/settings/metadatas'), 1)
+        self.assertEqual(self.seerr.calls.count('/api/v1/tv/94404'), 1)
+        self.assertEqual(self.seerr.calls.count('/api/v1/tv/94404/season/1'), 1)
+
+    def test_published_coordinate_reuses_complete_show_snapshot(self):
+        resolver = SeerrEpisodeResolver(self.seerr, cache_seconds=3600)
+        for _ in range(20):
+            resolver.require_coordinate(94404, 370761, 1, 5)
+        self.assertEqual(len(self.seerr.calls), 3)
+
+    def test_published_regular_coordinate_cannot_be_special(self):
+        self.seerr.season_number = 0
+        resolver = SeerrEpisodeResolver(self.seerr, cache_seconds=3600)
+        with self.assertRaisesRegex(ValueError, 'regular'):
+            resolver.require_coordinate(94404, 370761, 0, 5)
+
+    def test_same_count_provider_identity_change_invalidates_snapshot(self):
+        resolver = SeerrEpisodeResolver(self.seerr, cache_seconds=3600)
+        self.assertEqual(resolver.resolve(94404, 370761, 7398592), (1, 5))
+        self.seerr.episode_id = 8888888
+        with self.assertRaisesRegex(ValueError, 'catalogue changed'):
+            resolver.revalidate_show(94404, 370761)
+        with self.assertRaisesRegex(ValueError, 'absent'):
+            resolver.resolve(94404, 370761, 7398592)
+
+    def test_provider_switch_invalidates_old_snapshot(self):
+        resolver = SeerrEpisodeResolver(self.seerr, cache_seconds=3600)
+        self.assertEqual(resolver.resolve(94404, 370761, 7398592), (1, 5))
+        self.seerr.anime_provider = 'tmdb'
+        with self.assertRaisesRegex(ValueError, 'provider changed'):
+            resolver.revalidate_show(94404, 370761)
+        with self.assertRaisesRegex(ValueError, 'provider changed'):
+            resolver.resolve(94404, 370761, 7398592)
+
+    def test_two_show_snapshots_have_bounded_independent_requests(self):
+        class TwoShows:
+            def __init__(self, first):
+                self.first = first
+                self.calls = []
+
+            def request_json(self, method, path):
+                self.calls.append(path)
+                if path in ('/api/v1/settings/metadatas',
+                            '/api/v1/tv/94404',
+                            '/api/v1/tv/94404/season/1'):
+                    return self.first.request_json(method, path)
+                if path == '/api/v1/tv/200':
+                    return {'id': 200, 'externalIds': {'tvdbId': 300},
+                            'seasons': [{'seasonNumber': 1, 'episodeCount': 1}]}
+                if path == '/api/v1/tv/200/season/1':
+                    return {'episodes': [{'id': 400, 'seasonNumber': 1,
+                                          'episodeNumber': 1}]}
+                raise AssertionError(path)
+
+        two = TwoShows(self.seerr)
+        resolver = SeerrEpisodeResolver(two, cache_seconds=3600)
+        for _ in range(20):
+            self.assertEqual(resolver.resolve(94404, 370761, 7398592), (1, 5))
+            self.assertEqual(resolver.resolve(200, 300, 400), (1, 1))
+        self.assertEqual(len(two.calls), 6)
+
+    def test_interrupted_refresh_does_not_reuse_old_snapshot(self):
+        resolver = SeerrEpisodeResolver(self.seerr, cache_seconds=3600)
+        self.assertEqual(resolver.resolve(94404, 370761, 7398592), (1, 5))
+        original = self.seerr.request_json
+
+        def interrupted(method, path):
+            if path == '/api/v1/tv/94404/season/1':
+                raise OSError('provider interrupted')
+            return original(method, path)
+
+        self.seerr.request_json = interrupted
+        with self.assertRaisesRegex(OSError, 'interrupted'):
+            resolver.revalidate_show(94404, 370761)
+        with self.assertRaisesRegex(OSError, 'interrupted'):
+            resolver.resolve(94404, 370761, 7398592)
+        self.seerr.request_json = original
+        self.assertEqual(resolver.resolve(94404, 370761, 7398592), (1, 5))
+
+    def test_revalidation_without_prior_snapshot_cannot_pass(self):
+        resolver = SeerrEpisodeResolver(self.seerr, cache_seconds=3600)
+        with self.assertRaisesRegex(ValueError, 'snapshot absent'):
+            resolver.revalidate_show(94404, 370761)
+
+    def test_saved_fingerprint_detects_change_after_cache_eviction(self):
+        resolver = SeerrEpisodeResolver(self.seerr, cache_seconds=3600)
+        resolver.resolve(94404, 370761, 7398592)
+        fingerprint = resolver.snapshot_fingerprint(94404, 370761)
+        resolver._cache.clear()  # A long export can evict an early show.
+        self.seerr.episode_id = 8888888
+        with self.assertRaisesRegex(ValueError, 'catalogue changed'):
+            resolver.revalidate_show(
+                94404, 370761, expected_fingerprint=fingerprint)
+
+    def test_saved_fingerprint_detects_same_id_coordinate_move(self):
+        resolver = SeerrEpisodeResolver(self.seerr, cache_seconds=3600)
+        resolver.resolve(94404, 370761, 7398592)
+        fingerprint = resolver.snapshot_fingerprint(94404, 370761)
+        self.seerr.episode_number = 6
+        with self.assertRaisesRegex(ValueError, 'catalogue changed'):
+            resolver.revalidate_show(
+                94404, 370761, expected_fingerprint=fingerprint)
 
     def test_removal_needs_shoko_404_and_both_plex_sections_absent(self):
         self.assertFalse(self.reader().confirm_removed(42, 1051))

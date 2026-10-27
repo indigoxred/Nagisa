@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import re
 import sqlite3
+import stat
 from typing import Iterator
 
 from .seerr_compat_links import LinkProof
@@ -74,6 +75,7 @@ class CompatibilityLinkStore:
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
+        os.close(self._open_private_file(self.path))
         db = sqlite3.connect(self.path, timeout=30)
         try:
             db.row_factory = sqlite3.Row
@@ -89,12 +91,26 @@ class CompatibilityLinkStore:
         if self.lock_path.is_symlink():
             raise ValueError('compatibility lock path cannot be a symlink')
         import fcntl  # Linux-only link writer; not imported during Windows tests.
-        with self.lock_path.open('a+b') as stream:
+        with os.fdopen(self._open_private_file(self.lock_path), 'r+b') as stream:
             fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
             try:
                 yield
             finally:
                 fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+    @staticmethod
+    def _open_private_file(path: Path) -> int:
+        flags = os.O_RDWR | os.O_CREAT | getattr(os, 'O_NOFOLLOW', 0)
+        fd = os.open(path, flags, 0o600)
+        try:
+            if hasattr(os, 'fchmod'):
+                os.fchmod(fd, 0o600)
+            else:  # Windows-only fixture runs; operational store is Linux.
+                path.chmod(0o600)
+        except BaseException:
+            os.close(fd)
+            raise
+        return fd
 
     def _link_for(self, slot: str, suffix: str) -> Path:
         if suffix not in _VIDEO_SUFFIXES:
@@ -558,7 +574,12 @@ class CompatibilityLinkStore:
         for directory in (show, link.parent):
             if directory.is_symlink():
                 raise ValueError('compatibility directory cannot be a symlink')
-            directory.mkdir(exist_ok=True)
+            directory.mkdir(mode=0o755, exist_ok=True)
+            mode = stat.S_IMODE(directory.stat().st_mode)
+            if directory.stat().st_uid == os.geteuid():
+                directory.chmod((mode & 0o7000) | 0o755)
+            elif mode & 0o055 != 0o055:
+                raise ValueError('compatibility directory is not Plex readable')
         match = show / '.plexmatch'
         expected = self.plexmatch_text(show_id, provider=self.identity_provider)
         if match.is_symlink():
@@ -572,6 +593,11 @@ class CompatibilityLinkStore:
                     stream.write(expected)
             except FileExistsError:
                 raise ValueError('Plex match hint was concurrently replaced')
+        mode = stat.S_IMODE(match.stat().st_mode)
+        if match.stat().st_uid == os.geteuid():
+            match.chmod(0o644)
+        elif mode & 0o044 != 0o044:
+            raise ValueError('Plex match hint is not Plex readable')
 
     @staticmethod
     def plexmatch_text(show_id: int, *, provider: str = 'tvdb') -> str:

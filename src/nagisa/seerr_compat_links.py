@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from collections import OrderedDict
+import hashlib
+import json
 import os
 from pathlib import Path
 import re
@@ -58,13 +60,71 @@ class SeerrEpisodeResolver:
             raise ValueError('invalid Seerr episode resolver')
         self.seerr = seerr
         self.cache_seconds = cache_seconds
-        self._cache: OrderedDict[int, tuple[float, tuple, dict]] = OrderedDict()
+        self._cache: OrderedDict[int, tuple[float, int, str, dict]] = OrderedDict()
 
     def resolve(self, tmdb_show_id: int, tvdb_show_id: int,
                 tvdb_episode_id: int) -> tuple[int, int]:
         if not all(_id(value) for value in
                    (tmdb_show_id, tvdb_show_id, tvdb_episode_id)):
             raise ValueError('exact Seerr provider identities required')
+        index = self._index(tmdb_show_id, tvdb_show_id)
+        coordinate = index.get(tvdb_episode_id)
+        if coordinate is None:
+            raise ValueError('exact TVDB episode absent from Seerr')
+        if coordinate[0] == 0:
+            raise ValueError('regular TV episode cannot use Seerr special coordinate')
+        return coordinate
+
+    def _index(self, tmdb_show_id: int,
+               tvdb_show_id: int) -> dict[int, tuple[int, int]]:
+        current = self._cache.get(tmdb_show_id)
+        if (current is not None and time.monotonic() < current[0]
+                and current[1] == tvdb_show_id):
+            self._cache.move_to_end(tmdb_show_id)
+            return current[3]
+        return self._fetch_show(tmdb_show_id, tvdb_show_id)
+
+    def snapshot_fingerprint(self, tmdb_show_id: int,
+                             tvdb_show_id: int) -> str:
+        """Return the complete catalogue identity already read for this show."""
+        current = self._cache.get(tmdb_show_id)
+        if (not _id(tmdb_show_id) or not _id(tvdb_show_id)
+                or current is None or current[1] != tvdb_show_id
+                or time.monotonic() >= current[0]):
+            raise ValueError('Seerr provider snapshot absent')
+        return current[2]
+
+    def revalidate_show(self, tmdb_show_id: int, tvdb_show_id: int,
+                        *, expected_fingerprint: str | None = None) -> None:
+        """Refresh a complete show and reject a changed episode catalogue."""
+        if not _id(tmdb_show_id) or not _id(tvdb_show_id):
+            raise ValueError('exact Seerr provider identities required')
+        if (expected_fingerprint is not None
+                and (not isinstance(expected_fingerprint, str)
+                     or re.fullmatch('[0-9a-f]{64}', expected_fingerprint)
+                     is None)):
+            raise ValueError('valid Seerr provider fingerprint required')
+        old = self._cache.pop(tmdb_show_id, None)
+        if (old is not None and old[1] != tvdb_show_id
+                or old is None and expected_fingerprint is None):
+            raise ValueError('Seerr provider snapshot absent')
+        baseline = (expected_fingerprint if expected_fingerprint is not None
+                    else old[2])
+        if old is not None and old[2] != baseline:
+            raise ValueError('Seerr episode catalogue changed')
+        index = self._fetch_show(tmdb_show_id, tvdb_show_id)
+        if baseline != self._fingerprint(index):
+            raise ValueError('Seerr episode catalogue changed')
+
+    @staticmethod
+    def _fingerprint(index: dict[int, tuple[int, int]]) -> str:
+        digest = hashlib.sha256()
+        for episode_id, (season, episode) in sorted(index.items()):
+            digest.update(f'{episode_id}:{season}:{episode};'.encode('ascii'))
+        return digest.hexdigest()
+
+    def _fetch_show(self, tmdb_show_id: int,
+                    tvdb_show_id: int) -> dict[int, tuple[int, int]]:
         settings = self.seerr.request_json('GET', '/api/v1/settings/metadatas')
         if not isinstance(settings, dict) or settings.get('anime') != 'tvdb':
             raise ValueError('Seerr anime episode provider changed')
@@ -88,87 +148,107 @@ class SeerrEpisodeResolver:
             summary.append((row['seasonNumber'], row['episodeCount']))
         if len(set(number for number, _ in summary)) != len(summary):
             raise ValueError('Seerr season census is ambiguous')
-        signature = tuple(sorted(summary))
-        current = self._cache.get(tmdb_show_id)
-        if (current is not None and time.monotonic() < current[0]
-                and signature == current[1]):
-            self._cache.move_to_end(tmdb_show_id)
-            index = current[2]
-        else:
-            index: dict[int, tuple[int, int]] = {}
-            coordinates = set()
-            for season, count in signature:
-                if not count:
-                    continue
-                detail = self.seerr.request_json(
-                    'GET', f'/api/v1/tv/{tmdb_show_id}/season/{season}')
-                episodes = detail.get('episodes') if isinstance(detail, dict) else None
-                if not isinstance(episodes, list) or len(episodes) != count:
-                    raise ValueError('Seerr season episode census is incomplete')
-                for row in episodes:
-                    if (not isinstance(row, dict) or not _id(row.get('id'))
-                            or row.get('seasonNumber') != season
-                            or type(row.get('episodeNumber')) is not int
-                            or not 1 <= row['episodeNumber'] <= 9999
-                            or row['id'] in index
-                            or (season > 0 and
-                                (season, row['episodeNumber']) in coordinates)):
-                        raise ValueError('Seerr episode identity is ambiguous')
-                    coordinate = season, row['episodeNumber']
-                    index[row['id']] = coordinate
-                    if season > 0:
-                        coordinates.add(coordinate)
-            if len(index) > 10000:
-                raise ValueError('Seerr show episode census exceeds bound')
-            self._cache[tmdb_show_id] = (
-                time.monotonic() + self.cache_seconds, signature, index)
-            self._cache.move_to_end(tmdb_show_id)
-            if len(self._cache) > 128:
-                self._cache.popitem(last=False)
-        coordinate = index.get(tvdb_episode_id)
-        if coordinate is None:
-            raise ValueError('exact TVDB episode absent from Seerr')
-        if coordinate[0] == 0:
-            raise ValueError('regular TV episode cannot use Seerr special coordinate')
-        return coordinate
+        index: dict[int, tuple[int, int]] = {}
+        coordinates = set()
+        for season, count in sorted(summary):
+            if not count:
+                continue
+            detail = self.seerr.request_json(
+                'GET', f'/api/v1/tv/{tmdb_show_id}/season/{season}')
+            episodes = detail.get('episodes') if isinstance(detail, dict) else None
+            if not isinstance(episodes, list) or len(episodes) != count:
+                raise ValueError('Seerr season episode census is incomplete')
+            for row in episodes:
+                if (not isinstance(row, dict) or not _id(row.get('id'))
+                        or row.get('seasonNumber') != season
+                        or type(row.get('episodeNumber')) is not int
+                        or not 1 <= row['episodeNumber'] <= 9999
+                        or row['id'] in index
+                        or (season > 0 and
+                            (season, row['episodeNumber']) in coordinates)):
+                    raise ValueError('Seerr episode identity is ambiguous')
+                coordinate = season, row['episodeNumber']
+                index[row['id']] = coordinate
+                if season > 0:
+                    coordinates.add(coordinate)
+        if len(index) > 10000:
+            raise ValueError('Seerr show episode census exceeds bound')
+        self._cache[tmdb_show_id] = (
+            time.monotonic() + self.cache_seconds, tvdb_show_id,
+            self._fingerprint(index), index)
+        self._cache.move_to_end(tmdb_show_id)
+        if len(self._cache) > 128:
+            self._cache.popitem(last=False)
+        return index
 
     def require_coordinate(self, tmdb_show_id: int, tvdb_show_id: int,
                            season: int, episode: int) -> None:
         """Check Seerr's season slot without treating its episode ID as TVDB."""
+        if season == 0:
+            raise ValueError('regular published episode cannot use Specials')
         if (not _id(tmdb_show_id) or not _id(tvdb_show_id)
-                or type(season) is not int or season < 0
-                or not _id(episode)):
+                or type(season) is not int or not 1 <= season <= 999
+                or not _id(episode) or episode > 9999):
             raise ValueError('invalid published episode coordinate')
-        settings = self.seerr.request_json('GET', '/api/v1/settings/metadatas')
-        show = self.seerr.request_json('GET', f'/api/v1/tv/{tmdb_show_id}')
-        external = show.get('externalIds') if isinstance(show, dict) else None
-        seasons = show.get('seasons') if isinstance(show, dict) else None
-        if (not isinstance(settings, dict) or settings.get('anime') != 'tvdb'
-                or not isinstance(show, dict) or show.get('id') != tmdb_show_id
-                or not isinstance(external, dict)
-                or external.get('tvdbId') != tvdb_show_id
-                or not isinstance(seasons, list) or len(seasons) > 100):
-            raise ValueError('published show conflicts with Seerr identity')
-        summaries = [row for row in seasons if isinstance(row, dict)
-                     and row.get('seasonNumber') == season]
-        if (len(summaries) != 1
-                or type(summaries[0].get('episodeCount')) is not int
-                or not 1 <= summaries[0]['episodeCount'] <= 1000):
-            raise ValueError('published season absent from Seerr')
-        count = summaries[0]['episodeCount']
-        detail = self.seerr.request_json(
-            'GET', f'/api/v1/tv/{tmdb_show_id}/season/{season}')
-        rows = detail.get('episodes') if isinstance(detail, dict) else None
-        if not isinstance(rows, list) or len(rows) != count:
-            raise ValueError('published season incomplete in Seerr')
-        numbers = [row.get('episodeNumber') for row in rows
-                   if isinstance(row, dict) and row.get('seasonNumber') == season
-                   and _id(row.get('id'))]
-        if (len(numbers) != count or len(set(numbers)) != count
-                or any(not _id(number) or number > 9999 for number in numbers)):
-            raise ValueError('published season ambiguous in Seerr')
-        if episode not in numbers:
+        index = self._index(tmdb_show_id, tvdb_show_id)
+        if (season, episode) not in index.values():
             raise ValueError('published coordinate absent from Seerr')
+
+
+class OwnedPublishedCoordinate:
+    """Retain a no-ID coordinate only for the same ready, intact owned link."""
+
+    def __init__(self, store: Any) -> None:
+        if (getattr(store, 'identity_provider', None) != 'tmdb'
+                or not isinstance(getattr(store, 'root', None), Path)
+                or not store.root.is_absolute()
+                or not callable(getattr(store, 'lookup_file', None))):
+            raise ValueError('exact owned TMDB link store required')
+        self.store = store
+
+    def __call__(self, *, file_id: int, tmdb_episode_id: int,
+                 plex_target: str, tmdb_show_id: int, tvdb_show_id: int,
+                 shoko_series_id: int, anidb_episode_id: int
+                 ) -> tuple[int, int] | None:
+        if (not all(_id(value) for value in
+                    (file_id, tmdb_episode_id, tmdb_show_id, tvdb_show_id,
+                     shoko_series_id, anidb_episode_id))
+                or not isinstance(plex_target, str)
+                or not plex_target.startswith('/')):
+            raise ValueError('exact published-link identity required')
+        row = self.store.lookup_file(file_id)
+        if (not isinstance(row, dict) or row.get('file_id') != file_id
+                or row.get('series_id') != shoko_series_id
+                or row.get('anidb_episode_id') != anidb_episode_id
+                or row.get('tmdb_episode_id') != tmdb_episode_id
+                or row.get('tmdb_show_id') != tmdb_show_id
+                or row.get('tvdb_episode_id') is not None
+                or row.get('target') != plex_target
+                or row.get('state') != 'ready'):
+            return None
+        slot = row.get('slot')
+        match = (re.fullmatch(r'([1-9][0-9]*)/([1-9][0-9]*)/'
+                              r'([1-9][0-9]*)', slot)
+                 if isinstance(slot, str) else None)
+        if match is None or int(match.group(1)) != tmdb_show_id:
+            return None
+        season, episode = int(match.group(2)), int(match.group(3))
+        if season > 999 or episode > 9999:
+            return None
+        link_name = row.get('link')
+        if not isinstance(link_name, str):
+            return None
+        suffix = Path(link_name).suffix.lower()
+        if suffix not in ('.mkv', '.mp4', '.m4v', '.avi', '.ts'):
+            return None
+        expected_link = (f'tmdb-{tmdb_show_id}/Season {season:02d}/'
+                         f'S{season:02d}E{episode:02d}{suffix}')
+        if link_name != expected_link:
+            return None
+        link = self.store.root / expected_link
+        if not link.is_symlink() or os.readlink(link) != plex_target:
+            return None
+        return season, episode
 
 
 class LinkProofReader:
@@ -181,7 +261,9 @@ class LinkProofReader:
                  ignored_source_folders: dict[int, Path] | None = None,
                  seerr_cache_seconds: int = 0,
                  published_resolver: Callable[..., tuple[int, int]] | None = None,
-                 coordinate_mode: str = 'tvdb') -> None:
+                 coordinate_mode: str = 'tvdb',
+                 owner_cache_size: int = 0,
+                 provider_cache_size: int = 0) -> None:
         if (not callable(getattr(shoko, 'request_json', None))
                 or not callable(owner_reader)
                 or not callable(getattr(plex, 'request_json', None))
@@ -192,6 +274,10 @@ class LinkProofReader:
                 or not all(map(_id, sections))
                 or not allowed_folders or not callable(part_probe)
                 or coordinate_mode not in ('tvdb', 'tmdb')
+                or type(owner_cache_size) is not int
+                or not 0 <= owner_cache_size <= 128
+                or type(provider_cache_size) is not int
+                or not 0 <= provider_cache_size <= 128
                 or (coordinate_mode == 'tmdb' and published_resolver is not None)
                 or (published_resolver is not None
                     and not callable(published_resolver))):
@@ -228,6 +314,90 @@ class LinkProofReader:
         self.part_probe = part_probe
         self.published_resolver = published_resolver
         self.coordinate_mode = coordinate_mode
+        self.owner_cache_size = owner_cache_size
+        self._owner_cache: OrderedDict[int, Any] = OrderedDict()
+        self._show_id_cache: OrderedDict[tuple[str, int, int],
+                                          tuple[int, int | None]] = OrderedDict()
+        self._show_id_fingerprints: dict[tuple[str, int, int],
+                                         tuple[int, int | None]] = {}
+        self._folder_cache: dict[int, tuple[int, str, str]] = {}
+        self.provider_cache_size = provider_cache_size
+        self._provider_cache: OrderedDict[int, Any] = OrderedDict()
+        self._provider_fingerprints: dict[int, str] = {}
+
+    def invalidate_owner_cache(self) -> None:
+        """Start a fresh public-Plex and Shoko-provider verification epoch."""
+        self._owner_cache.clear()
+        self._show_id_cache.clear()
+        self._show_id_fingerprints.clear()
+        self._folder_cache.clear()
+        self._provider_cache.clear()
+        self._provider_fingerprints.clear()
+
+    def _owner_cards(self, series_id: int) -> Any:
+        if self.owner_cache_size and series_id in self._owner_cache:
+            self._owner_cache.move_to_end(series_id)
+            return self._owner_cache[series_id]
+        cards = self.owner_reader(series_id)
+        if not isinstance(cards, dict) or set(cards) != set(self.sections):
+            raise ValueError('configured public Plex sections are required')
+        if self.owner_cache_size:
+            self._owner_cache[series_id] = cards
+            if len(self._owner_cache) > self.owner_cache_size:
+                self._owner_cache.popitem(last=False)
+        return cards
+
+    def _provider_episodes(self, tmdb_show_id: int) -> dict:
+        if self.provider_cache_size and tmdb_show_id in self._provider_cache:
+            self._provider_cache.move_to_end(tmdb_show_id)
+            return self._provider_cache[tmdb_show_id]
+        provider = self.shoko.request_json(
+            'GET', f'/api/v3/Tmdb/Show/{tmdb_show_id}/Episode?page=1&pageSize=0')
+        rows = provider.get('List') if isinstance(provider, dict) else None
+        if not isinstance(rows, list) or len(rows) > 10000:
+            raise ValueError('Shoko provider episode crosswalk is incomplete')
+        if self.provider_cache_size:
+            fingerprint = hashlib.sha256(json.dumps(
+                provider, sort_keys=True, separators=(',', ':'),
+                ensure_ascii=True).encode('ascii')).hexdigest()
+            prior = self._provider_fingerprints.setdefault(
+                tmdb_show_id, fingerprint)
+            if prior != fingerprint:
+                raise ValueError('Shoko provider changed during proof epoch')
+            self._provider_cache[tmdb_show_id] = provider
+            if len(self._provider_cache) > self.provider_cache_size:
+                self._provider_cache.popitem(last=False)
+        return provider
+
+    def revalidate_provider_snapshots(self) -> None:
+        """Check cached Shoko and public Plex identities against fresh reads."""
+        for show_id, expected in sorted(self._provider_fingerprints.items()):
+            provider = self.shoko.request_json(
+                'GET', f'/api/v3/Tmdb/Show/{show_id}/Episode?page=1&pageSize=0')
+            rows = provider.get('List') if isinstance(provider, dict) else None
+            if not isinstance(rows, list) or len(rows) > 10000:
+                raise ValueError('Shoko provider episode crosswalk is incomplete')
+            actual = hashlib.sha256(json.dumps(
+                provider, sort_keys=True, separators=(',', ':'),
+                ensure_ascii=True).encode('ascii')).hexdigest()
+            if actual != expected:
+                raise ValueError('Shoko provider changed during proof epoch')
+        for folder_id, expected in sorted(self._folder_cache.items()):
+            folder = self.shoko.request_json(
+                'GET', f'/api/v3/ManagedFolder/{folder_id}')
+            actual = ((folder.get('ID'), folder.get('Path'),
+                       folder.get('DropFolderType'))
+                      if isinstance(folder, dict) else None)
+            if actual != expected:
+                raise ValueError('Shoko managed-folder root changed during proof epoch')
+        for (key, section, series_id), expected in sorted(
+                self._show_id_fingerprints.items()):
+            try:
+                actual = self._fetch_show_ids(key, section, series_id)
+            except ValueError as error:
+                raise ValueError('public Plex show changed during proof epoch') from error
+            if actual != expected:
+                raise ValueError('public Plex show changed during proof epoch')
 
     def _location(self, file_id: int, record: dict) -> tuple[tuple[Path, str], ...]:
         locations = record.get('Locations')
@@ -245,13 +415,20 @@ class LinkProofReader:
             is_source = folder_id in self.ignored_source_folders
             root = (self.ignored_source_folders[folder_id] if is_source
                     else self.allowed_folders[folder_id][0])
-            folder = self.shoko.request_json(
-                'GET', f'/api/v3/ManagedFolder/{folder_id}')
+            frozen_folder = (self._folder_cache.get(folder_id)
+                             if self.owner_cache_size else None)
+            folder = ({'ID': frozen_folder[0], 'Path': frozen_folder[1],
+                       'DropFolderType': frozen_folder[2]}
+                      if frozen_folder is not None else self.shoko.request_json(
+                          'GET', f'/api/v3/ManagedFolder/{folder_id}'))
             if (not isinstance(folder, dict) or folder.get('ID') != folder_id
                     or (folder.get('DropFolderType') == 'Source') != is_source
                     or not isinstance(folder.get('Path'), str)
                     or Path(folder['Path']).resolve() != root.resolve()):
                 raise ValueError('Shoko managed-folder root changed')
+            if self.owner_cache_size and frozen_folder is None:
+                self._folder_cache[folder_id] = (
+                    folder['ID'], folder['Path'], folder['DropFolderType'])
             relative = row.get('RelativePath')
             if (not isinstance(relative, str) or not relative.startswith('/')
                     or '\\' in relative or '\x00' in relative):
@@ -279,6 +456,22 @@ class LinkProofReader:
     def _show_ids(self, key: Any, section: int, series_id: int) -> tuple[int, int | None]:
         if not str(key).isdigit() or int(key) <= 0:
             raise ValueError('Plex show key is invalid')
+        cache_key = str(key), section, series_id
+        if self.owner_cache_size and cache_key in self._show_id_cache:
+            self._show_id_cache.move_to_end(cache_key)
+            return self._show_id_cache[cache_key]
+        result = self._fetch_show_ids(key, section, series_id)
+        if self.owner_cache_size:
+            previous = self._show_id_fingerprints.setdefault(cache_key, result)
+            if previous != result:
+                raise ValueError('public Plex show changed during proof epoch')
+            self._show_id_cache[cache_key] = result
+            if len(self._show_id_cache) > 2 * self.owner_cache_size:
+                self._show_id_cache.popitem(last=False)
+        return result
+
+    def _fetch_show_ids(self, key: Any, section: int,
+                        series_id: int) -> tuple[int, int | None]:
         response = self.plex.request_json(
             'GET', f'/library/metadata/{key}?includeGuids=1&skipRefresh=1')
         body = response.get('MediaContainer') if isinstance(response, dict) else None
@@ -331,7 +524,42 @@ class LinkProofReader:
                 # Let the movie reader verify every association and Part.
                 raise NotRegularTVFile(
                     'multi-episode movie is outside TV view', kind='Movie')
-        if not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], dict):
+        if not isinstance(rows, list) or not all(isinstance(item, dict)
+                                                 for item in rows):
+            raise ValueError('Shoko file episode association is ambiguous')
+        if len(rows) == 2:
+            regular = [item for item in rows if isinstance(item.get('AniDB'), dict)
+                       and item['AniDB'].get('Type') == 'Episode']
+            specials = [item for item in rows if isinstance(item.get('AniDB'), dict)
+                        and item['AniDB'].get('Type') == 'Special']
+            if len(regular) == len(specials) == 1:
+                main_ids = regular[0].get('IDs')
+                extra_ids = specials[0].get('IDs')
+                main_tmdb = main_ids.get('TMDB') if isinstance(main_ids, dict) else None
+                extra_tmdb = extra_ids.get('TMDB') if isinstance(extra_ids, dict) else None
+                main_show = main_tmdb.get('Show') if isinstance(main_tmdb, dict) else None
+                special_show = extra_tmdb.get('Show') if isinstance(extra_tmdb, dict) else None
+                special_episode = extra_tmdb.get('Episode') if isinstance(extra_tmdb, dict) else None
+                if (isinstance(main_ids, dict) and isinstance(extra_ids, dict)
+                        and isinstance(main_show, list) and len(main_show) == 1
+                        and _id(main_show[0])
+                        and main_ids.get('ParentSeries') == extra_ids.get('ParentSeries')
+                        and _id(main_ids.get('ParentSeries'))
+                        and _id(extra_ids.get('ID'))
+                        and extra_ids['ID'] != main_ids.get('ID')
+                        and _id(extra_ids.get('AniDB'))
+                        and extra_ids['AniDB'] != main_ids.get('AniDB')
+                        and extra_ids['AniDB'] == specials[0]['AniDB'].get('ID')
+                        and isinstance(extra_tmdb, dict)
+                        and extra_tmdb.get('Movie') == []
+                        and (special_show == [] and special_episode == []
+                             or special_show == main_show
+                             and isinstance(special_episode, list)
+                             and len(special_episode) == 1
+                             and _id(special_episode[0])
+                             and special_episode != main_tmdb.get('Episode'))):
+                    rows = regular
+        if len(rows) != 1:
             raise ValueError('Shoko file episode association is ambiguous')
         row = rows[0]
         ids = row.get('IDs')
@@ -356,12 +584,14 @@ class LinkProofReader:
                 or tmdb.get('Movie') != []):
             raise ValueError('Shoko episode lacks one regular provider identity')
         destinations = self._location(file_id, record)
-        owner = self.owner_reader(ids['ParentSeries'])
+        owner = self._owner_cards(ids['ParentSeries'])
         if not isinstance(owner, dict) or set(owner) != set(self.sections):
             raise ValueError('configured public Plex sections are required')
         coordinates: set[tuple[int, int]] = set()
         show_ids: set[tuple[int, int | None]] = set()
         selected_destinations: set[tuple[Path, str]] = set()
+        card_guids: set[str] = set()
+        expected_guid = f"tv.plex.agents.custom.shoko://episode/e{ids['ID']}"
         for section in self.sections:
             cards = owner[section]
             if not isinstance(cards, list) or len(cards) > 10000:
@@ -382,8 +612,14 @@ class LinkProofReader:
             if len(matched) != 1:
                 raise ValueError('Plex file belongs to zero or multiple cards')
             card, parts = matched[0]
-            if (card.get('guid') !=
-                    f"tv.plex.agents.custom.shoko://episode/e{ids['ID']}"
+            card_guid = card.get('guid')
+            part_suffix = (card_guid[len(expected_guid) + 1:]
+                           if isinstance(card_guid, str)
+                           and card_guid.startswith(expected_guid + 'p') else '')
+            relay_part = (self.coordinate_mode == 'tmdb'
+                          and re.fullmatch(r'(?:[1-9]|1[0-9]|20)',
+                                           part_suffix) is not None)
+            if ((card_guid != expected_guid and not relay_part)
                     or type(card.get('parentIndex')) is not int
                     or type(card.get('index')) is not int
                     or card['parentIndex'] < 0 or card['index'] < 1
@@ -391,6 +627,7 @@ class LinkProofReader:
                     or int(parts[0].get('size', 0)) != record['Size']
                     or self.part_probe(parts[0]['file']) is not True):
                 raise ValueError('Plex episode or file evidence differs')
+            card_guids.add(card_guid)
             matching_destinations = []
             for source, alias in destinations:
                 try:
@@ -409,7 +646,7 @@ class LinkProofReader:
                                         section, ids['ParentSeries']))
         if len(selected_destinations) != 1:
             raise ValueError('mirrored Plex physical destinations disagree')
-        if len(coordinates) != 1 or len(show_ids) != 1:
+        if len(coordinates) != 1 or len(show_ids) != 1 or len(card_guids) != 1:
             raise ValueError('mirrored Plex identity or coordinates disagree')
         source, target = next(iter(selected_destinations))
         tmdb_show_id, tvdb_show_id = next(iter(show_ids))
@@ -420,8 +657,7 @@ class LinkProofReader:
         # Public Relay cards and Shoko derive from the same association. Check
         # Seerr's independent episode namespace before creating a TV-season
         # link in its availability source.
-        provider = self.shoko.request_json(
-            'GET', f'/api/v3/Tmdb/Show/{tmdb_show_id}/Episode?page=1&pageSize=0')
+        provider = self._provider_episodes(tmdb_show_id)
         provider_rows = provider.get('List') if isinstance(provider, dict) else None
         if not isinstance(provider_rows, list) or len(provider_rows) > 10000:
             raise ValueError('Shoko provider episode crosswalk is incomplete')
@@ -448,6 +684,9 @@ class LinkProofReader:
                            and item.get('EpisodeNumber') == episode
                            and item.get('IsHidden') is False) != 1):
                 raise ValueError('TMDB episode coordinate is hidden or ambiguous')
+            if (next(iter(card_guids)) != expected_guid
+                    and coordinates != {(season, episode)}):
+                raise ValueError('Relay part coordinate differs from exact TMDB episode')
             tvdb_episode_id = native.get('TvdbEpisodeID')
             if tvdb_episode_id is not None and not _id(tvdb_episode_id):
                 raise ValueError('TMDB episode has malformed TVDB cross-reference')
@@ -457,24 +696,26 @@ class LinkProofReader:
                              season, episode, source, target, record['Size'])
         tvdb_episode_id = (matches[0].get('TvdbEpisodeID')
                            if matches else None)
-        published = None
-        if self.published_resolver is not None:
-            result = self.published_resolver(
-                tmdb_show_id=tmdb_show_id, tvdb_show_id=tvdb_show_id,
-                shoko_series_id=ids['ParentSeries'],
-                anidb_episode_id=ids['AniDB'])
-            if (result is not None and
-                    (not isinstance(result, tuple) or len(result) != 2
-                     or type(result[0]) is not int or result[0] < 0
-                     or not _id(result[1]))):
-                raise ValueError('published episode result is invalid')
-            published = result
+        if tvdb_episode_id is not None and not _id(tvdb_episode_id):
+            raise ValueError('TMDB episode has malformed TVDB cross-reference')
         if _id(tvdb_episode_id):
             season, episode = self.seerr_episodes.resolve(
                 tmdb_show_id, tvdb_show_id, tvdb_episode_id)
-            if published is not None and published != (season, episode):
-                raise ValueError('published episode differs from Shoko crosswalk')
         else:
+            published = None
+            if self.published_resolver is not None:
+                result = self.published_resolver(
+                    file_id=file_id, tmdb_episode_id=tmdb['Episode'][0],
+                    plex_target=target,
+                    tmdb_show_id=tmdb_show_id, tvdb_show_id=tvdb_show_id,
+                    shoko_series_id=ids['ParentSeries'],
+                    anidb_episode_id=ids['AniDB'])
+                if (result is not None and
+                        (not isinstance(result, tuple) or len(result) != 2
+                         or type(result[0]) is not int or result[0] < 0
+                         or not _id(result[1]))):
+                    raise ValueError('published episode result is invalid')
+                published = result
             if published is None:
                 raise ValueError('TMDB episode has no unique TVDB episode identity')
             season, episode = published

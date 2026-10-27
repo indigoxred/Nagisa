@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+from datetime import datetime
+import json
 from pathlib import Path
+import re
 from typing import Any
 
 from .http import JsonTransport
 from .reconciler.arrival_readers import StockPlexOwnerReader
 from .seerr_compat_events import CompatibilityLinkEvents
 from .seerr_compat_census import ShokoInitialCensus
-from .seerr_compat_links import LinkProofReader
+from .seerr_compat_links import LinkProofReader, OwnedPublishedCoordinate
 from .seerr_compat_mapping_audit import OwnedMappingAudit
 from .seerr_compat_series_recheck import ScopedSeriesRecheck, OwnedSeriesAudit
 from .seerr_compat_owned_audit import OwnedDeletionAudit
@@ -21,21 +24,79 @@ from .shoko_long_poll import ShokoLongPoll, ShokoLongPollHttp
 from .shoko_recent_catchup import ShokoRecentCatchup, ShokoRecentCatchupWorker
 
 
+def _require_canonical_stage(store: CompatibilityLinkStore, settings: dict,
+                             config_root: Path) -> Path:
+    """Identify a separately reviewed stage before canonical writes are wired."""
+    receipt = settings.get('canonical_stage_receipt_sha256')
+    cursor = settings.get('initial_cursor')
+    if (not isinstance(receipt, str)
+            or re.fullmatch(r'[0-9a-f]{64}', receipt) is None
+            or not isinstance(cursor, dict)
+            or set(cursor) != {'imported_utc', 'file_id'}
+            or type(cursor['file_id']) is not int or cursor['file_id'] <= 0
+            or not isinstance(cursor['imported_utc'], str)):
+        raise ValueError('canonical stage receipt and exact cursor required')
+    try:
+        imported = datetime.fromisoformat(
+            cursor['imported_utc'].replace('Z', '+00:00'))
+    except ValueError:
+        raise ValueError('canonical stage cursor is invalid') from None
+    if imported.tzinfo is None or imported.utcoffset() is None:
+        raise ValueError('canonical stage cursor lacks a time zone')
+    marker = store.root / '.nagisa-canonical-stage.json'
+    if (marker.is_symlink() or not marker.is_file()
+            or not 0 < marker.stat().st_size <= 4096):
+        raise ValueError('canonical stage marker is absent')
+    try:
+        saved = json.loads(marker.read_text(encoding='utf-8'))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        raise ValueError('canonical stage marker is invalid') from None
+    if (not isinstance(saved, dict)
+            or set(saved) != {'schema', 'episode_ordering', 'receipt_sha256',
+                              'initial_cursor', 'initial_ready'}
+            or type(saved['schema']) is not int or saved['schema'] != 1
+            or saved['episode_ordering'] != 'seerr_tvdb'
+            or saved['receipt_sha256'] != receipt
+            or saved['initial_cursor'] != cursor
+            or type(saved['initial_ready']) is not int
+            or not 0 < saved['initial_ready'] <= 32768):
+        raise ValueError('canonical stage marker differs from settings')
+    manifest = store.manifest()
+    links = manifest.get('links') if isinstance(manifest, dict) else None
+    if not isinstance(links, dict) or not links:
+        raise ValueError('canonical stage ledger is empty')
+    if not (config_root / 'seerr-compat-canonical-cursor.json').exists():
+        if (len(links) != saved['initial_ready']
+                or any(not isinstance(row, dict)
+                       or row.get('state') != 'ready'
+                       for row in links.values())):
+            raise ValueError('canonical stage initial ledger differs')
+    return marker
+
+
 def build_tmdb_event_worker(config: Any, shoko: Any, reader: LinkProofReader,
                             store: CompatibilityLinkStore, settings: dict, *,
                             refresh: VerifiedShowRefresh | None = None
                             ) -> tuple[ShokoEventWorker, tuple]:
     """Assemble a worker without starting a listener, scan, or census."""
     options = {'mode', 'initial_cursor', 'page_size', 'max_pages',
-               'refresh_debounce_seconds'}
+               'refresh_debounce_seconds', 'episode_ordering',
+               'canonical_stage_receipt_sha256'}
     if (not isinstance(settings, dict) or not set(settings).issubset(options)
             or settings.get('mode') not in ('report', 'apply')
             or not isinstance(reader, LinkProofReader)
             or not isinstance(store, CompatibilityLinkStore)
             or reader.shoko is not shoko
-            or reader.coordinate_mode != 'tmdb'
             or store.identity_provider != 'tmdb'):
         raise ValueError('TMDB hidden feed reader and settings required')
+    episode_ordering = settings.get('episode_ordering', 'tmdb')
+    if (episode_ordering not in ('tmdb', 'seerr_tvdb')
+            or reader.coordinate_mode != ('tvdb' if episode_ordering == 'seerr_tvdb'
+                                           else 'tmdb')):
+        raise ValueError('private episode order does not match reader')
+    if (episode_ordering != 'seerr_tvdb'
+            and 'canonical_stage_receipt_sha256' in settings):
+        raise ValueError('canonical stage receipt requires exact episode order')
     if settings['mode'] == 'apply' and (not isinstance(refresh, VerifiedShowRefresh)
                                        or refresh.store is not store
                                        or refresh.identity_provider != 'tmdb'):
@@ -48,21 +109,27 @@ def build_tmdb_event_worker(config: Any, shoko: Any, reader: LinkProofReader,
         raise ValueError('Nagisa configuration directory is invalid')
     if store.root == root or store.root.is_relative_to(root):
         raise ValueError('hidden feed requires a separate media root')
+    stage_marker = None
+    if episode_ordering == 'seerr_tvdb' and settings['mode'] == 'apply':
+        stage_marker = _require_canonical_stage(store, settings, root)
 
-    pending = JsonSessionJournal(root / 'seerr-compat-tmdb-pending.json')
-    cursor = JsonSessionJournal(root / 'seerr-compat-tmdb-cursor.json')
-    backlog = JsonSessionJournal(root / 'seerr-compat-tmdb-backlog.json')
+    journal_prefix = ('seerr-compat-canonical'
+                      if episode_ordering == 'seerr_tvdb'
+                      else 'seerr-compat-tmdb')
+    pending = JsonSessionJournal(root / f'{journal_prefix}-pending.json')
+    cursor = JsonSessionJournal(root / f'{journal_prefix}-cursor.json')
+    backlog = JsonSessionJournal(root / f'{journal_prefix}-backlog.json')
     processor = CompatibilityLinkEvents(
         reader, store, pending, write_enabled=settings['mode'] == 'apply',
         refresh=refresh,
         refresh_debounce_seconds=settings.get('refresh_debounce_seconds', 30))
     series_journal = JsonSessionJournal(
-        root / 'seerr-compat-tmdb-series-recheck.json')
+        root / f'{journal_prefix}-series-recheck.json')
     series_recheck = ScopedSeriesRecheck(
         shoko, processor, series_journal, batch_size=5)
     processor.attach_series_recheck(series_recheck)
     series_audit_journal = JsonSessionJournal(
-        root / 'seerr-compat-tmdb-series-audit.json')
+        root / f'{journal_prefix}-series-audit.json')
     series_audit = OwnedSeriesAudit(
         store, series_recheck, series_audit_journal,
         batch_size=5, interval_seconds=600)
@@ -98,7 +165,8 @@ def build_tmdb_event_worker(config: Any, shoko: Any, reader: LinkProofReader,
          'read/write'),
         (str(series_audit_journal.path), 'Private TMDB series audit cursor',
          'read/write'),
-    )
+    ) + (((str(stage_marker), 'Reviewed canonical stage identity', 'read-only'),)
+         if stage_marker is not None else ())
     return worker, bindings
 
 
@@ -110,11 +178,14 @@ def build_configured_tmdb_feed(config: Any, shoko: Any, plex: Any,
     required = {'mode', 'link_root', 'plex_link_root', 'section_id',
                 'source_section_ids', 'managed_folders', 'ignored_folders'}
     optional = {'initial_cursor', 'page_size', 'max_pages',
-                'refresh_debounce_seconds'}
+                'refresh_debounce_seconds', 'episode_ordering',
+                'canonical_stage_receipt_sha256'}
     if (not isinstance(settings, dict)
             or not required.issubset(settings)
             or not set(settings).issubset(required | optional)
             or settings['mode'] not in ('report', 'apply')
+            or settings.get('episode_ordering', 'tmdb') not in
+               ('tmdb', 'seerr_tvdb')
             or type(settings['section_id']) is not int
             or settings['section_id'] <= 0
             or not isinstance(settings['source_section_ids'], list)
@@ -192,18 +263,24 @@ def build_configured_tmdb_feed(config: Any, shoko: Any, plex: Any,
 
     require_section()
     sections = tuple(settings['source_section_ids'])
-    owner = StockPlexOwnerReader(
-        plex, sections, batch_details=True, exact_guid_filter=True)
-    reader = LinkProofReader(
-        shoko, owner, plex, seerr, sections=sections,
-        allowed_folders=managed, ignored_source_folders=ignored,
-        part_probe=part_probe, seerr_cache_seconds=0,
-        coordinate_mode='tmdb')
     ledger = link_root / '.nagisa-compat-tmdb.sqlite'
     if (ledger.is_symlink() or not ledger.is_file()
             or ledger.stat().st_size == 0):
         raise ValueError('private feed ownership ledger is absent')
     store = CompatibilityLinkStore(link_root, identity_provider='tmdb')
+    owner = StockPlexOwnerReader(
+        plex, sections, batch_details=True, exact_guid_filter=True)
+    reader = LinkProofReader(
+        shoko, owner, plex, seerr, sections=sections,
+        allowed_folders=managed, ignored_source_folders=ignored,
+        part_probe=part_probe,
+        seerr_cache_seconds=(3600 if settings.get('episode_ordering') == 'seerr_tvdb'
+                             else 0),
+        published_resolver=(OwnedPublishedCoordinate(store)
+                            if settings.get('episode_ordering') == 'seerr_tvdb'
+                            else None),
+        coordinate_mode=('tvdb' if settings.get('episode_ordering') == 'seerr_tvdb'
+                         else 'tmdb'))
     refresh = None
     if settings['mode'] == 'apply':
         transport = JsonTransport(
@@ -237,8 +314,11 @@ def build_configured_tmdb_feed(config: Any, shoko: Any, plex: Any,
     worker.owned_audit = OwnedDeletionAudit(
         ShokoInitialCensus(shoko, page_size=1000, max_files=32768),
         store, worker.processor)
+    mapping_prefix = ('seerr-compat-canonical'
+                      if settings.get('episode_ordering') == 'seerr_tvdb'
+                      else 'seerr-compat-tmdb')
     mapping_journal = JsonSessionJournal(
-        Path(config.config_dir) / 'seerr-compat-tmdb-mapping.json')
+        Path(config.config_dir) / f'{mapping_prefix}-mapping.json')
     worker.mapping_audit = OwnedMappingAudit(
         store, worker.processor, mapping_journal, batch_size=25)
     source_bindings = tuple(
