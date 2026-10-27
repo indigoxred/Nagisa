@@ -14,6 +14,7 @@ from typing import Any
 
 from .shoko_file_signal import parse_signalr_frames
 from .seerr_compat_links import NotRegularTVFile
+from .seerr_compat_series_recheck import parse_metadata_series_frames
 
 _MAX_HELD = 8192  # Stays comfortably inside JsonSessionJournal's 1 MiB cap.
 
@@ -63,6 +64,7 @@ class CompatibilityLinkEvents:
         self.refresh = refresh
         self.movie_events = movie_events
         self.movie_resolver = movie_resolver
+        self.series_recheck: Any = None
         self.refresh_debounce_seconds = refresh_debounce_seconds
         self._lock = threading.RLock()
         self._refresh_due = time.monotonic() + refresh_debounce_seconds
@@ -244,9 +246,27 @@ class CompatibilityLinkEvents:
         self._pending = pending
         self._held = held
 
-    @_synchronized
     def ingest(self, frame: str) -> None:
+        # Persist metadata series intent before file notices. The scoped
+        # recheck may later call back into this worker; do not hold our lock
+        # while taking its lock or a review/ingest pair could deadlock.
+        if self.series_recheck is not None:
+            changed = parse_metadata_series_frames(frame)
+            if changed:
+                self.series_recheck.enqueue_series_ids(changed)
+        self._ingest_files(frame)
+
+    def attach_series_recheck(self, recheck: Any) -> None:
+        if (self.series_recheck is not None
+                or not callable(getattr(recheck, 'enqueue_series_ids', None))):
+            raise ValueError('series recheck already attached or invalid')
+        self.series_recheck = recheck
+
+    @_synchronized
+    def _ingest_files(self, frame: str) -> None:
         events = parse_signalr_frames(frame)
+        if not events:
+            return
         pending = self._pending.copy()
         held = self._held.copy()
         for subject, file_id in events:

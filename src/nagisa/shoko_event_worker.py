@@ -14,6 +14,8 @@ class ShokoEventWorker:
                  request_catchup: Any = None,
                  owned_audit: Any = None,
                  mapping_audit: Any = None,
+                 series_recheck: Any = None,
+                 series_audit: Any = None,
                  review_limit: int = 1,
                  retry_seconds: int = 30, max_retry_seconds: int = 3600) -> None:
         if type(review_limit) is not int or not 1 <= review_limit <= 10:
@@ -32,6 +34,10 @@ class ShokoEventWorker:
                     getattr(owned_audit, 'run_once', None)))
                 or (mapping_audit is not None and not callable(
                     getattr(mapping_audit, 'run_once', None)))
+                or (series_recheck is not None and not callable(
+                    getattr(series_recheck, 'run_once', None)))
+                or (series_audit is not None and not callable(
+                    getattr(series_audit, 'run_once', None)))
                 or (stop is not None and not isinstance(stop, threading.Event))
                 or type(retry_seconds) is not int
                 or type(max_retry_seconds) is not int
@@ -44,6 +50,8 @@ class ShokoEventWorker:
         self.request_catchup = request_catchup
         self.owned_audit = owned_audit
         self.mapping_audit = mapping_audit
+        self.series_recheck = series_recheck
+        self.series_audit = series_audit
         self.review_limit = review_limit
         self.stop_event = stop or threading.Event()
         self.retry_seconds = retry_seconds
@@ -128,6 +136,12 @@ class ShokoEventWorker:
             self.owned_audit.run_once()
         if self.mapping_audit is not None:
             self.mapping_audit.run_once()
+        # Drain existing exact-file work before adding one bounded series
+        # slice. Otherwise a full durable queue could prevent its own drain.
+        if self.series_audit is not None:
+            self.series_audit.run_once()
+        if self.series_recheck is not None:
+            self.series_recheck.run_once()
         return result
 
     def check_recent_once(self) -> None:

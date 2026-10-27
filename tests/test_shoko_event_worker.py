@@ -190,6 +190,23 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(worker.review_pending_once(), 'checked')
         self.assertEqual(order, ['file', 'mapping'])
 
+    def test_scoped_series_recheck_queues_after_file_review(self):
+        order = []
+
+        class OrderedProcessor(Processor):
+            def review_one(self):
+                order.append('file')
+                return 'checked'
+
+        class SeriesRecheck:
+            def run_once(self):
+                order.append('series')
+
+        worker = ShokoEventWorker(lambda: Client(), OrderedProcessor(),
+                                  series_recheck=SeriesRecheck())
+        self.assertEqual(worker.review_pending_once(), 'checked')
+        self.assertEqual(order, ['file', 'series'])
+
     def test_request_catchup_still_runs_during_file_backlog(self):
         order = []
         class OrderedProcessor(Processor):

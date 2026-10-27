@@ -2,6 +2,7 @@
 
 import os
 import sqlite3
+import stat
 import tempfile
 import unittest
 from dataclasses import replace
@@ -58,6 +59,7 @@ class CompatibilityPlexHintTests(unittest.TestCase):
                 db.close()
             self.assertEqual(store.owned_file_ids_after(0, 1), (11,))
             self.assertEqual(store.owned_file_ids_after(11, 2), (12,))
+            self.assertEqual(store.owned_series_ids_after(0, 2), (1,))
 
     def test_mapping_update_reads_owned_and_contested_ids_for_exact_shows(self):
         with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as directory:
@@ -98,6 +100,31 @@ class CompatibilityLinkStoreTests(unittest.TestCase):
         return LinkProof(file_id, 99, 1051, 225738, 1948394, 7398592, 94404,
                          370761, 1, 5, self.source,
                          plex_target or str(self.source), 8)
+
+    def test_new_link_directories_and_hint_are_plex_readable_with_private_umask(self):
+        link = self.store._link_for('370761/1/5', '.mkv')
+        previous = os.umask(0o077)
+        try:
+            self.store._prepare_directory(link, 370761)
+        finally:
+            os.umask(previous)
+        show = self.root / 'tvdb-370761'
+        self.assertEqual(stat.S_IMODE(show.stat().st_mode), 0o755)
+        self.assertEqual(stat.S_IMODE(link.parent.stat().st_mode), 0o755)
+        self.assertEqual(stat.S_IMODE((show / '.plexmatch').stat().st_mode),
+                         0o644)
+
+    def test_ledger_and_lock_stay_private_with_permissive_umask(self):
+        root = self.base / 'open-umask-view'
+        root.mkdir()
+        previous = os.umask(0)
+        try:
+            store = CompatibilityLinkStore(root)
+        finally:
+            os.umask(previous)
+        self.assertEqual(stat.S_IMODE(store.path.stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(store.lock_path.stat().st_mode),
+                         0o600)
 
     def test_tmdb_mixed_card_quarantines_exact_owned_union_and_future_event(self):
         store = CompatibilityLinkStore(self.root, identity_provider='tmdb')
