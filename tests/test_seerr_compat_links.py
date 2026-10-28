@@ -21,6 +21,8 @@ class FakeShoko:
         self.deleted = False
         self.extra_locations = []
         self.tvdb_episode_id = 7398592
+        self.tmdb_show_id = 94404
+        self.tmdb_episode_id = 1948394
         self.tmdb_season = 2
         self.tmdb_episode = 3
         self.tmdb_hidden = False
@@ -43,7 +45,8 @@ class FakeShoko:
         if path == '/api/v3/File/42/Episode?includeDataFrom=AniDB':
             return [{'IDs': {'ID': self.episode_id, 'ParentSeries': 1051,
                              'AniDB': 225738, 'TMDB': {
-                                 'Show': [94404], 'Episode': [1948394],
+                                 'Show': [self.tmdb_show_id],
+                                 'Episode': [self.tmdb_episode_id],
                                  'Movie': []}},
                      'AniDB': {'ID': 225738, 'Type': self.episode_type,
                                'EpisodeNumber': 5}},
@@ -230,6 +233,16 @@ class LinkProofReaderTests(unittest.TestCase):
         self.assertTrue(reader.confirm_native_mapping_changed(42, owned))
         self.shoko.tmdb_episode = 3
         self.shoko.tmdb_hidden = True
+        self.assertTrue(reader.confirm_native_mapping_changed(42, owned))
+
+    def test_tvdb_order_confirms_changed_shoko_provider_without_public_plex(self):
+        reader = self.reader(coordinate_mode='tvdb')
+        owned = {'file_id': 42, 'tmdb_show_id': 94404,
+                 'tmdb_episode_id': 1948394, 'slot': '370761/1/5',
+                 'series_id': 1051, 'anidb_episode_id': 225738}
+        self.assertFalse(reader.confirm_native_mapping_changed(42, owned))
+        self.shoko.tmdb_show_id = 77694
+        self.shoko.tmdb_episode_id = 4789321
         self.assertTrue(reader.confirm_native_mapping_changed(42, owned))
 
     def test_native_tmdb_reader_holds_incomplete_provider_page(self):

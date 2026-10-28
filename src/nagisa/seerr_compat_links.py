@@ -728,8 +728,8 @@ class LinkProofReader:
 
     def confirm_native_mapping_changed(self, file_id: int,
                                        owned: dict) -> bool:
-        """Confirm a changed owned TMDB claim from Shoko alone, never a timeout."""
-        if self.coordinate_mode != 'tmdb' or not _id(file_id):
+        """Confirm a changed owned provider claim from Shoko alone, never a timeout."""
+        if not _id(file_id):
             return False
         if (not isinstance(owned, dict) or owned.get('file_id') != file_id
                 or not all(_id(owned.get(key)) for key in
@@ -764,6 +764,8 @@ class LinkProofReader:
                     or tmdb['Show'][0] != owned['tmdb_show_id']
                     or tmdb['Episode'][0] != owned['tmdb_episode_id']):
                 return True
+            if self.coordinate_mode != 'tmdb':
+                return False
             provider = self.shoko.request_json(
                 'GET', f"/api/v3/Tmdb/Show/{owned['tmdb_show_id']}"
                        '/Episode?page=1&pageSize=0')

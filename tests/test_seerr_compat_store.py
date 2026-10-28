@@ -538,6 +538,34 @@ class CompatibilityLinkStoreTests(unittest.TestCase):
                          43)
         self.assertEqual(self.source.read_bytes(), b'original')
 
+    def test_confirmed_provider_remap_withdraws_only_owned_private_link(self):
+        self.store.upsert(self.proof())
+        old_link = self.store._link_for('370761/1/5', '.mkv')
+        self.assertTrue(old_link.is_symlink())
+
+        def stale_public_card(_file_id):
+            raise ValueError('public Plex still has the previous show ID')
+
+        reader = SimpleNamespace(
+            read=stale_public_card,
+            confirm_native_mapping_changed=lambda file_id, owned: (
+                file_id == 42 and owned['tmdb_show_id'] == 94404))
+        journal = JsonSessionJournal(self.base / 'events.json')
+        worker = CompatibilityLinkEvents(
+            reader, self.store, journal, write_enabled=True,
+            refresh=lambda *_: True, refresh_debounce_seconds=0,
+            clock=lambda: 1000.0)
+        worker.enqueue_exact_file_ids([42])
+        self.assertEqual(worker.run_pending(limit=1),
+                         [(42, 'identity-withdrawn')])
+        self.assertIsNone(self.store.lookup_file(42))
+        self.assertFalse(old_link.exists())
+        self.assertTrue(self.source.is_file())
+        self.assertEqual(self.source.read_bytes(), b'original')
+        self.assertEqual(worker.catchup_queued_ids(), ())
+        self.assertEqual(worker.pending_ids(), (42,))
+        self.assertEqual([row[0] for row in journal.load()['held']], [42])
+
     def test_two_confirmed_deletions_clear_empty_contest(self):
         from dataclasses import replace
         incumbent = self.proof()
